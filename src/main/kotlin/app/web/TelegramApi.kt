@@ -13,6 +13,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.time.Duration
 
 private const val TG_LIMIT = 4096
+private const val TG_SAFE_CHUNK = 3500  // keep room for formatting
 
 class TelegramApi(private val token: String) {
     private val client = OkHttpClient.Builder()
@@ -62,14 +63,26 @@ class TelegramApi(private val token: String) {
         return allOk
     }
 
+    // Smart chunking: prefer section boundaries, keep safe size
     private fun chunks(s: String): List<String> {
         if (s.length <= TG_LIMIT) return listOf(s)
-        val out = ArrayList<String>(s.length / TG_LIMIT + 1)
-        var i = 0
-        while (i < s.length) {
-            val e = kotlin.math.min(i + TG_LIMIT, s.length)
-            out += s.substring(i, e); i = e
+        val parts = mutableListOf<String>()
+        val separators = listOf("\n---\n", "\n\n", "\n")
+        var remaining = s
+        while (remaining.length > TG_SAFE_CHUNK) {
+            var cut = TG_SAFE_CHUNK
+            // try to split on a nice boundary not far behind the limit
+            for (sep in separators) {
+                val idx = remaining.lastIndexOf(sep, TG_SAFE_CHUNK)
+                if (idx >= 0 && idx >= TG_SAFE_CHUNK - 400) {
+                    cut = idx + sep.length
+                    break
+                }
+            }
+            parts += remaining.substring(0, cut)
+            remaining = remaining.substring(cut)
         }
-        return out
+        if (remaining.isNotEmpty()) parts += remaining
+        return parts
     }
 }
