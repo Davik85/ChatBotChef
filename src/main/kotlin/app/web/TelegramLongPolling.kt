@@ -24,9 +24,10 @@ import java.time.Duration
  * Switch:
  *  - /start or /recipes -> CHEF
  *  - /caloriecalculator -> CALC (asks for one-message input)
- *  - /productinfo -> PRODUCT (asks for product name, single-message)
+ *  - /productinfo -> PRODUCT (asks for product name)
  *
  * No local math: GPT handles calculations and formatting.
+ * No reply keyboards: we always remove keyboards to avoid the bottom floating menu.
  */
 class TelegramLongPolling(
     private val token: String,
@@ -103,40 +104,36 @@ class TelegramLongPolling(
             lower == "/start" -> {
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
-                api.sendMessage(
-                    chatId = chatId,
-                    text = "Привет! Я шеф-повар-бот. Выбирай действие:",
-                    replyMarkup = mainKeyboard()
-                )
+                // Remove any old keyboards and send RU greeting
+                api.removeKeyboard(chatId, START_GREETING_RU)
             }
             lower == "/help" -> {
-                api.sendMessage(
+                api.removeKeyboard(
                     chatId,
                     "Команды:\n" +
                             "• /recipes — вернуться к шеф-повару (рецепты, советы)\n" +
                             "• /caloriecalculator — расчёт КБЖУ через ИИ\n" +
-                            "• /productinfo — КБЖУ ингредиента в удобном формате\n\n" +
-                            "Подсказка: после /caloriecalculator и /productinfo можно вернуться к рецептам через /recipes или /start."
+                            "• /productinfo — КБЖУ ингредиента\n\n" +
+                            "Подсказка: клавиатура скрыта, используйте меню с командами или печатайте их вручную."
                 )
             }
             lower == "/recipes" -> {
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
-                api.sendMessage(
+                api.removeKeyboard(
                     chatId,
-                    "Готов готовить! Напиши продукты/условия (время, калории, техника) — предложу рецепт.",
-                    replyMarkup = mainKeyboard()
+                    "Готов готовить! Напиши продукты/условия (время, калории, техника) — предложу рецепт."
                 )
             }
             lower == "/caloriecalculator" -> {
                 mode[chatId] = PersonaMode.CALC
                 state[chatId] = BotState.AWAITING_CALORIE_INPUT
-                api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
+                api.removeKeyboard(chatId, CALORIE_INPUT_PROMPT)
             }
             lower == "/productinfo" -> {
                 mode[chatId] = PersonaMode.PRODUCT
                 state[chatId] = BotState.AWAITING_PRODUCT_INPUT
-                api.sendMessage(chatId, PRODUCT_INPUT_PROMPT)
+                api.removeKeyboard(chatId, PRODUCT_INPUT_PROMPT)
             }
             else -> {
                 // Free text -> answer according to current persona
@@ -162,9 +159,8 @@ class TelegramLongPolling(
         val system = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
         val reply = llm.complete(listOf(system, user))
-        api.removeKeyboard(chatId, reply)
-        state.remove(chatId)
-        // Stay in CALC mode until user switches via /recipes or /start
+        api.sendMessage(chatId, reply)
+        state.remove(chatId) // stay in CALC persona, but no pending input
     }
 
     // ----- Product info persona -----
@@ -172,27 +168,24 @@ class TelegramLongPolling(
         val system = ChatMessage("system", ProductInfoPrompt.SYSTEM)
         val user = ChatMessage("user", "Ингредиент: $userText")
         val reply = llm.complete(listOf(system, user))
-        api.removeKeyboard(chatId, reply)
-        state.remove(chatId)
-        // Stay in PRODUCT mode until user switches via /recipes or /start
+        api.sendMessage(chatId, reply)
+        state.remove(chatId) // stay in PRODUCT persona, but no pending input
     }
 
-    // ----- UI helpers -----
-    private fun mainKeyboard(): ReplyKeyboardMarkup =
-        ReplyKeyboardMarkup(
-            keyboard = listOf(
-                listOf(KeyboardButton("/recipes")),
-                listOf(KeyboardButton("/caloriecalculator")),
-                listOf(KeyboardButton("/productinfo"), KeyboardButton("/help"))
-            ),
-            resize_keyboard = true,
-            one_time_keyboard = false
-        )
-
     companion object {
+        private const val START_GREETING_RU =
+            "Привет! Я шеф-повар-бот.\n\n" +
+                    "Что умею:\n" +
+                    "• Придумываю рецепты под твои продукты, время и технику.\n" +
+                    "• Считаю КБЖУ под цель через ИИ (/caloriecalculator).\n" +
+                    "• Даю сводку по калорийности и БЖУ продукта (/productinfo).\n\n" +
+                    "Напиши продукты или используй команды из меню.\n" +
+                    "Вернуться к рецептам: /recipes"
+
         private const val CALORIE_INPUT_PROMPT =
-            "Пришли в одном сообщении: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), " +
-                    "сколько шагов в день и сколько тренировок в неделю, цель (похудеть/набрать массу).\n\n" +
+            "Пришли в одном сообщении: пол, возраст, рост (см), вес (кг), " +
+                    "образ жизни (пассивный/активный), сколько шагов в день и сколько тренировок в неделю, " +
+                    "цель (похудеть/набрать массу).\n\n" +
                     "Пример: «мужчина, 40 лет, 175 см, 80 кг, активный, 9000 шагов, 4 тренировки в неделю, цель похудеть»."
 
         private const val PRODUCT_INPUT_PROMPT =
