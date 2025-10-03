@@ -2,165 +2,142 @@ package app.web
 
 import app.AppConfig
 import app.common.Json
-import app.db.PremiumRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
-import app.logic.MemoryService
-import app.logic.RateLimiter
-import app.logic.Safety
-import app.web.dto.LpMessage
-import app.web.dto.LpResp
-import app.web.dto.LpUpdate
+import app.logic.CalorieCalculatorPrompt
+import app.web.dto.*
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlinx.coroutines.delay
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.time.Duration
-import kotlin.math.max
 
-private const val LONG_POLL_TIMEOUT_SEC = 25
-
+/**
+ * Long polling loop + command router.
+ * /caloriecalculator now uses a dedicated system prompt from CalorieCalculatorPrompt.
+ * No local math — GPT does BMR/TDEE and macros.
+ */
 class TelegramLongPolling(
     private val token: String,
-    private val tg: TelegramApi,
-    private val ai: OpenAIClient,
-    private val mem: MemoryService
+    private val llm: OpenAIClient
 ) {
     private val http = OkHttpClient.Builder()
-        .callTimeout(Duration.ofSeconds(LONG_POLL_TIMEOUT_SEC + 10L))
+        .callTimeout(Duration.ofSeconds(30))
         .connectTimeout(Duration.ofSeconds(10))
-        .readTimeout(Duration.ofSeconds(LONG_POLL_TIMEOUT_SEC + 10L))
+        .readTimeout(Duration.ofSeconds(30))
         .build()
 
+    private val api = TelegramApi(token)
     private val mapper = Json.mapper
 
-    @Volatile
-    private var running = true
+    // Minimal in-memory state per chat
+    private val state = mutableMapOf<Long, BotState>()
 
-    suspend fun start() {
-        tg.getMe() // просто лог, не фейлим старт
+    private enum class BotState { AWAITING_CALORIE_INPUT }
 
-        var offset = 0L
-        var backoff = 400L
-        println("POLL: start (timeout=${LONG_POLL_TIMEOUT_SEC}s)")
+    suspend fun run() {
+        require(api.getMe()) { "Telegram getMe failed" }
 
-        while (running) {
+        var offset: Long? = null
+        while (true) {
             try {
-                val url = "${AppConfig.TELEGRAM_BASE}/bot$token/getUpdates" +
-                        "?timeout=$LONG_POLL_TIMEOUT_SEC&offset=$offset&allowed_updates=%5B%22message%22%5D"
-                val req = Request.Builder().url(url).get().build()
-
-                http.newCall(req).execute().use { resp ->
-                    val raw = resp.body?.string().orEmpty()
-                    if (!resp.isSuccessful) error("getUpdates HTTP ${resp.code} ${resp.message} body=$raw")
-
-                    val data: LpResp<List<LpUpdate>> = mapper.readValue(raw)
-                    if (!data.ok) {
-                        val ra = data.parameters?.retry_after
-                        if (data.error_code == 429 && ra != null) {
-                            println("POLL: 429 Too Many Requests → sleep ${ra}s")
-                            delay(ra * 1000L); return@use
-                        }
-                        error("getUpdates API ${data.error_code}: ${data.description}")
-                    }
-
-                    val updates = data.result.orEmpty()
-                    if (updates.isEmpty()) {
-                        println("POLL: 0 updates (offset=$offset)")
-                    } else {
-                        println("POLL: got ${updates.size} updates (offset=$offset)")
-                        for (u in updates) {
-                            offset = max(offset, u.update_id + 1)
-                            u.message?.let { handleMessage(it) }
-                        }
-                    }
-                    backoff = 400L
+                val updates = getUpdates(offset)
+                if (updates.isEmpty()) {
+                    delay(1200); continue
                 }
-            } catch (e: Exception) {
-                println("POLL-ERR: ${e.message}")
-                delay(backoff)
-                backoff = (backoff * 2).coerceAtMost(15_000)
+                for (u in updates) {
+                    offset = u.update_id + 1
+                    val msg = u.message ?: u.edited_message ?: continue
+                    val text = msg.text?.trim().orEmpty()
+                    if (text.isBlank()) continue
+                    route(msg.chat.id, text)
+                }
+            } catch (t: Throwable) {
+                println("POLLING-ERR: ${t.message}")
+                delay(1500)
             }
         }
     }
 
-    fun stop() {
-        running = false
+    private fun getUpdates(offset: Long?): List<TgUpdate> {
+        val base = "${AppConfig.TELEGRAM_BASE}/bot$token/getUpdates?timeout=25"
+        val url = if (offset != null) "$base&offset=$offset" else base
+        val req = okhttp3.Request.Builder().url(url).get().build()
+        http.newCall(req).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) return emptyList()
+            val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(raw)
+            return if (parsed.ok) parsed.result ?: emptyList() else emptyList()
+        }
     }
 
-    private fun handleMessage(msg: LpMessage) {
-        val tgUserId = msg.from?.id ?: msg.chat.id
-        val text = msg.text?.trim().orEmpty()
-        if (text.isEmpty()) return
-
-        println("MSG: from=$tgUserId text='${text.take(60)}'")
-
-        if (text == "/start") {
-            tg.sendMessage(
-                msg.chat.id,
-                """Привет! Я твой друг - AI-повар. Напиши, какой рецепт ты хочешь получить.
-                    |- Например: "Что приготовить из курицы и риса?".
-                    |- Я помогу с идеями и советами по готовке!
-                    |- Или скажи какие ингредиенты у тебя есть, предпочтения по кухне и диете – и я предложу рецепт.
-                    |- Чтобы узнать подробности и возможности, отправь /help
-                """.trimMargin()
-            )
+    // ----- Router -----
+    private fun route(chatId: Long, text: String) {
+        // If we expect the calorie input, short-circuit.
+        if (state[chatId] == BotState.AWAITING_CALORIE_INPUT && !text.startsWith("/")) {
+            handleCalorieInput(chatId, text)
             return
         }
 
-        // 1) Кризис — всегда приоритетнее
-        if (Safety.isCrisis(text)) {
-            val safe = """
-                Похоже, тебе сейчас очень тяжело. Ты не один.
-                В экстренной ситуации звони 112. Бесплатные линии поддержки: 8-800-2000-122, 8-800-700-06-00.
-                Я рядом и готова поговорить столько, сколько нужно.
-            """.trimIndent()
-            tg.sendMessage(msg.chat.id, safe)
-            return
-        }
-
-        // 2) Премиум/лимит
-        val isPremium = PremiumRepo.isPremium(tgUserId)
-        if (!isPremium) {
-            val can = RateLimiter.canSend(tgUserId)
-            if (!can) {
-                val left = RateLimiter.remaining(tgUserId)
-                println("LIMIT-HIT: user=$tgUserId remaining=$left")
-                tg.sendMessage(msg.chat.id, AppConfig.PAYWALL_TEXT)
-                return
+        when (text.lowercase()) {
+            "/start" -> {
+                api.sendMessage(
+                    chatId = chatId,
+                    text = "Привет! Я шеф-повар-бот.\nВыбирай действие:",
+                    replyMarkup = ReplyKeyboardMarkup(
+                        keyboard = listOf(
+                            listOf(KeyboardButton("/caloriecalculator")),
+                            listOf(KeyboardButton("/productinfo"), KeyboardButton("/help"))
+                        ),
+                        resize_keyboard = true,
+                        one_time_keyboard = false
+                    )
+                )
+            }
+            "/help" -> {
+                api.sendMessage(
+                    chatId,
+                    "Команды:\n" +
+                            "• /caloriecalculator — расчёт КБЖУ по твоим данным через ИИ\n" +
+                            "• /productinfo — КБЖУ ингредиента\n" +
+                            "Напиши «/caloriecalculator», и я попрошу ввести параметры одним сообщением."
+                )
+            }
+            "/caloriecalculator" -> {
+                state[chatId] = BotState.AWAITING_CALORIE_INPUT
+                api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
+            }
+            "/productinfo" -> {
+                api.sendMessage(chatId, "Скоро добавим. А пока можешь писать: «КБЖУ курица филе 100 г».")
+            }
+            else -> {
+                // Fallback to chef assistant persona
+                val sys = ChatMessage(
+                    "system",
+                    "Ты — дружелюбный шеф-повар и нутриционист. " +
+                            "Если запрос не относится к рецептам/еде/КБЖУ — вежливо подскажи команды /help."
+                )
+                val user = ChatMessage("user", text)
+                val reply = llm.complete(listOf(sys, user))
+                api.sendMessage(chatId, reply)
             }
         }
+    }
 
-        // 3) Контекст для LLM
-        val system = ChatMessage("system", app.logic.PersonaPrompt.system())
-        val memoryNote = mem.getNote(tgUserId)?.let { ChatMessage("system", "Memory: $it") }
-        val history = mem.recentDialog(tgUserId).flatMap { (role, content) ->
-            listOf(ChatMessage(role, content))
-        }
+    // ----- Calorie flow via GPT (uses external prompt object) -----
+    private fun handleCalorieInput(chatId: Long, userText: String) {
+        val system = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
+        val user = ChatMessage("user", "Данные пользователя: $userText")
+        val reply = llm.complete(listOf(system, user))
 
-        val messages = buildList {
-            add(system)
-            if (memoryNote != null) add(memoryNote)
-            addAll(history)
-            add(ChatMessage("user", text))
-        }
+        // Remove keyboard for clean reading, then clear state
+        api.removeKeyboard(chatId, reply)
+        state.remove(chatId)
+    }
 
-        // 4) Вызов LLM
-        val reply = try {
-            ai.complete(messages)
-        } catch (e: Exception) {
-            println("AI-ERR: ${e.message}")
-            AppConfig.FALLBACK_REPLY
-        }
-
-        // 5) Пишем в память и считаем лимит только ПОСЛЕ успешной отправки
-        val delivered = tg.sendMessage(msg.chat.id, reply)
-        if (delivered) {
-            mem.append(tgUserId, "user", text, System.currentTimeMillis())
-            mem.append(tgUserId, "assistant", reply, System.currentTimeMillis())
-            if (!isPremium) RateLimiter.increment(tgUserId)
-        } else {
-            println("SEND-WARN: message wasn't delivered (see SEND-ERR above).")
-        }
+    companion object {
+        private const val CALORIE_INPUT_PROMPT =
+            "Пришли **в одном сообщении**: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), " +
+                    "сколько шагов в день и сколько тренировок в неделю, цель (похудеть/набрать массу).\n\n" +
+                    "Пример: «мужчина, 40 лет, 175 см, 80 кг, активный, 9000 шагов, 4 тренировки в неделю, цель похудеть»."
     }
 }

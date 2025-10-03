@@ -2,9 +2,7 @@ package app.web
 
 import app.AppConfig
 import app.common.Json
-import app.web.dto.TgApiResp
-import app.web.dto.TgApiUserMe
-import app.web.dto.TgSendMessage
+import app.web.dto.*
 import com.fasterxml.jackson.module.kotlin.readValue
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -13,7 +11,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.time.Duration
 
 private const val TG_LIMIT = 4096
-private const val TG_SAFE_CHUNK = 3500  // keep room for formatting
+private const val TG_SAFE_CHUNK = 3500  // keep room for formatting/emoji
 
 class TelegramApi(private val token: String) {
     private val client = OkHttpClient.Builder()
@@ -43,10 +41,17 @@ class TelegramApi(private val token: String) {
         }
     }
 
-    fun sendMessage(chatId: Long, text: String): Boolean {
-        var allOk = true
+    fun sendMessage(
+        chatId: Long,
+        text: String,
+        parseMode: String? = null,
+        replyMarkup: ReplyMarkup? = null
+    ): Boolean {
+        var ok = true
         for (chunk in chunks(text)) {
-            val payload = mapper.writeValueAsString(TgSendMessage(chat_id = chatId, text = chunk))
+            val payload = mapper.writeValueAsString(
+                TgSendMessage(chat_id = chatId, text = chunk, parse_mode = parseMode, reply_markup = replyMarkup)
+            )
             val req = Request.Builder()
                 .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendMessage")
                 .post(payload.toRequestBody(json))
@@ -54,14 +59,17 @@ class TelegramApi(private val token: String) {
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    allOk = false; println("SEND-ERR: code=${resp.code} msg=${resp.message} body=$body")
+                    ok = false; println("SEND-ERR: code=${resp.code} msg=${resp.message} body=$body")
                 } else {
                     println("SEND: 200 len=${chunk.length}")
                 }
             }
         }
-        return allOk
+        return ok
     }
+
+    fun removeKeyboard(chatId: Long, text: String) =
+        sendMessage(chatId, text, parseMode = null, replyMarkup = ReplyKeyboardRemove())
 
     // Smart chunking: prefer section boundaries, keep safe size
     private fun chunks(s: String): List<String> {
@@ -71,7 +79,6 @@ class TelegramApi(private val token: String) {
         var remaining = s
         while (remaining.length > TG_SAFE_CHUNK) {
             var cut = TG_SAFE_CHUNK
-            // try to split on a nice boundary not far behind the limit
             for (sep in separators) {
                 val idx = remaining.lastIndexOf(sep, TG_SAFE_CHUNK)
                 if (idx >= 0 && idx >= TG_SAFE_CHUNK - 400) {
