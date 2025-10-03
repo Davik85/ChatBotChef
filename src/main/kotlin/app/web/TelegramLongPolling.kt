@@ -6,6 +6,7 @@ import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
 import app.logic.PersonaPrompt
 import app.logic.CalorieCalculatorPrompt
+import app.logic.ProductInfoPrompt
 import app.web.dto.*
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlinx.coroutines.delay
@@ -16,14 +17,16 @@ import java.time.Duration
  * Long polling + command router with persona switching.
  *
  * Personas:
- *  - CHEF (default): uses PersonaPrompt.system()
- *  - CALC: uses CalorieCalculatorPrompt. SYSTEM
+ *  - CHEF (default): PersonaPrompt.system()
+ *  - CALC: CalorieCalculatorPrompt. SYSTEM
+ *  - PRODUCT: ProductInfoPrompt. SYSTEM
  *
  * Switch:
  *  - /start or /recipes -> CHEF
  *  - /caloriecalculator -> CALC (asks for one-message input)
+ *  - /productinfo -> PRODUCT (asks for product name, single-message)
  *
- * No local math: CALC persona prompts GPT to compute BMR/TDEE/macros.
+ * No local math: GPT handles calculations and formatting.
  */
 class TelegramLongPolling(
     private val token: String,
@@ -42,8 +45,8 @@ class TelegramLongPolling(
     private val mode = mutableMapOf<Long, PersonaMode>()
     private val state = mutableMapOf<Long, BotState>()
 
-    private enum class PersonaMode { CHEF, CALC }
-    private enum class BotState { AWAITING_CALORIE_INPUT }
+    private enum class PersonaMode { CHEF, CALC, PRODUCT }
+    private enum class BotState { AWAITING_CALORIE_INPUT, AWAITING_PRODUCT_INPUT }
 
     suspend fun run() {
         require(api.getMe()) { "Telegram getMe failed" }
@@ -85,13 +88,15 @@ class TelegramLongPolling(
     private fun route(chatId: Long, text: String) {
         val lower = text.lowercase()
 
-        // If CALC is waiting for input and user sent non-command -> handle input
-        if (mode[chatId] == PersonaMode.CALC &&
-            state[chatId] == BotState.AWAITING_CALORIE_INPUT &&
-            !lower.startsWith("/")
-        ) {
-            handleCalorieInput(chatId, text)
-            return
+        // Short-circuits for awaited inputs
+        when (state[chatId]) {
+            BotState.AWAITING_CALORIE_INPUT -> {
+                if (!lower.startsWith("/")) { handleCalorieInput(chatId, text); return }
+            }
+            BotState.AWAITING_PRODUCT_INPUT -> {
+                if (!lower.startsWith("/")) { handleProductInput(chatId, text); return }
+            }
+            else -> {}
         }
 
         when {
@@ -110,8 +115,8 @@ class TelegramLongPolling(
                     "Команды:\n" +
                             "• /recipes — вернуться к шеф-повару (рецепты, советы)\n" +
                             "• /caloriecalculator — расчёт КБЖУ через ИИ\n" +
-                            "• /productinfo — КБЖУ ингредиента (скоро)\n\n" +
-                            "Подсказка: после /caloriecalculator можешь вернуться к рецептам через /recipes или /start."
+                            "• /productinfo — КБЖУ ингредиента в удобном формате\n\n" +
+                            "Подсказка: после /caloriecalculator и /productinfo можно вернуться к рецептам через /recipes или /start."
                 )
             }
             lower == "/recipes" -> {
@@ -129,16 +134,16 @@ class TelegramLongPolling(
                 api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
             }
             lower == "/productinfo" -> {
-                api.sendMessage(chatId, "Скоро добавим. Пока можно писать: «КБЖУ курица филе 100 г».")
+                mode[chatId] = PersonaMode.PRODUCT
+                state[chatId] = BotState.AWAITING_PRODUCT_INPUT
+                api.sendMessage(chatId, PRODUCT_INPUT_PROMPT)
             }
             else -> {
                 // Free text -> answer according to current persona
                 when (mode[chatId] ?: PersonaMode.CHEF) {
                     PersonaMode.CHEF -> handleChef(chatId, text)
-                    PersonaMode.CALC -> {
-                        // If not explicitly awaiting input, still treat any free text as input for calculator
-                        handleCalorieInput(chatId, text)
-                    }
+                    PersonaMode.CALC -> handleCalorieInput(chatId, text)
+                    PersonaMode.PRODUCT -> handleProductInput(chatId, text)
                 }
             }
         }
@@ -157,11 +162,19 @@ class TelegramLongPolling(
         val system = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
         val reply = llm.complete(listOf(system, user))
-
-        // Keep persona CALC until user returns via /recipes or /start,
-        // but remove keyboard for cleaner reading of long answer.
         api.removeKeyboard(chatId, reply)
         state.remove(chatId)
+        // Stay in CALC mode until user switches via /recipes or /start
+    }
+
+    // ----- Product info persona -----
+    private fun handleProductInput(chatId: Long, userText: String) {
+        val system = ChatMessage("system", ProductInfoPrompt.SYSTEM)
+        val user = ChatMessage("user", "Ингредиент: $userText")
+        val reply = llm.complete(listOf(system, user))
+        api.removeKeyboard(chatId, reply)
+        state.remove(chatId)
+        // Stay in PRODUCT mode until user switches via /recipes or /start
     }
 
     // ----- UI helpers -----
@@ -178,8 +191,12 @@ class TelegramLongPolling(
 
     companion object {
         private const val CALORIE_INPUT_PROMPT =
-            "Пришли **в одном сообщении**: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), " +
+            "Пришли в одном сообщении: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), " +
                     "сколько шагов в день и сколько тренировок в неделю, цель (похудеть/набрать массу).\n\n" +
                     "Пример: «мужчина, 40 лет, 175 см, 80 кг, активный, 9000 шагов, 4 тренировки в неделю, цель похудеть»."
+
+        private const val PRODUCT_INPUT_PROMPT =
+            "Пришли название ингредиента (можно с уточнением части/жирности и способа приготовления). Примеры:\n" +
+                    "«свинина шея», «лосось сырой», «куриная грудка без кожи», «рис отварной», «сыр моцарелла»."
     }
 }
