@@ -4,6 +4,7 @@ import app.AppConfig
 import app.common.Json
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
+import app.logic.PersonaPrompt
 import app.logic.CalorieCalculatorPrompt
 import app.web.dto.*
 import com.fasterxml.jackson.module.kotlin.readValue
@@ -12,9 +13,17 @@ import okhttp3.OkHttpClient
 import java.time.Duration
 
 /**
- * Long polling loop + command router.
- * /caloriecalculator now uses a dedicated system prompt from CalorieCalculatorPrompt.
- * No local math — GPT does BMR/TDEE and macros.
+ * Long polling + command router with persona switching.
+ *
+ * Personas:
+ *  - CHEF (default): uses PersonaPrompt.system()
+ *  - CALC: uses CalorieCalculatorPrompt. SYSTEM
+ *
+ * Switch:
+ *  - /start or /recipes -> CHEF
+ *  - /caloriecalculator -> CALC (asks for one-message input)
+ *
+ * No local math: CALC persona prompts GPT to compute BMR/TDEE/macros.
  */
 class TelegramLongPolling(
     private val token: String,
@@ -29,9 +38,11 @@ class TelegramLongPolling(
     private val api = TelegramApi(token)
     private val mapper = Json.mapper
 
-    // Minimal in-memory state per chat
+    // ---- Per-chat state ----
+    private val mode = mutableMapOf<Long, PersonaMode>()
     private val state = mutableMapOf<Long, BotState>()
 
+    private enum class PersonaMode { CHEF, CALC }
     private enum class BotState { AWAITING_CALORIE_INPUT }
 
     suspend fun run() {
@@ -72,67 +83,98 @@ class TelegramLongPolling(
 
     // ----- Router -----
     private fun route(chatId: Long, text: String) {
-        // If we expect the calorie input, short-circuit.
-        if (state[chatId] == BotState.AWAITING_CALORIE_INPUT && !text.startsWith("/")) {
+        val lower = text.lowercase()
+
+        // If CALC is waiting for input and user sent non-command -> handle input
+        if (mode[chatId] == PersonaMode.CALC &&
+            state[chatId] == BotState.AWAITING_CALORIE_INPUT &&
+            !lower.startsWith("/")
+        ) {
             handleCalorieInput(chatId, text)
             return
         }
 
-        when (text.lowercase()) {
-            "/start" -> {
+        when {
+            lower == "/start" -> {
+                mode[chatId] = PersonaMode.CHEF
+                state.remove(chatId)
                 api.sendMessage(
                     chatId = chatId,
-                    text = "Привет! Я шеф-повар-бот.\nВыбирай действие:",
-                    replyMarkup = ReplyKeyboardMarkup(
-                        keyboard = listOf(
-                            listOf(KeyboardButton("/caloriecalculator")),
-                            listOf(KeyboardButton("/productinfo"), KeyboardButton("/help"))
-                        ),
-                        resize_keyboard = true,
-                        one_time_keyboard = false
-                    )
+                    text = "Привет! Я шеф-повар-бот. Выбирай действие:",
+                    replyMarkup = mainKeyboard()
                 )
             }
-            "/help" -> {
+            lower == "/help" -> {
                 api.sendMessage(
                     chatId,
                     "Команды:\n" +
-                            "• /caloriecalculator — расчёт КБЖУ по твоим данным через ИИ\n" +
-                            "• /productinfo — КБЖУ ингредиента\n" +
-                            "Напиши «/caloriecalculator», и я попрошу ввести параметры одним сообщением."
+                            "• /recipes — вернуться к шеф-повару (рецепты, советы)\n" +
+                            "• /caloriecalculator — расчёт КБЖУ через ИИ\n" +
+                            "• /productinfo — КБЖУ ингредиента (скоро)\n\n" +
+                            "Подсказка: после /caloriecalculator можешь вернуться к рецептам через /recipes или /start."
                 )
             }
-            "/caloriecalculator" -> {
+            lower == "/recipes" -> {
+                mode[chatId] = PersonaMode.CHEF
+                state.remove(chatId)
+                api.sendMessage(
+                    chatId,
+                    "Готов готовить! Напиши продукты/условия (время, калории, техника) — предложу рецепт.",
+                    replyMarkup = mainKeyboard()
+                )
+            }
+            lower == "/caloriecalculator" -> {
+                mode[chatId] = PersonaMode.CALC
                 state[chatId] = BotState.AWAITING_CALORIE_INPUT
                 api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
             }
-            "/productinfo" -> {
-                api.sendMessage(chatId, "Скоро добавим. А пока можешь писать: «КБЖУ курица филе 100 г».")
+            lower == "/productinfo" -> {
+                api.sendMessage(chatId, "Скоро добавим. Пока можно писать: «КБЖУ курица филе 100 г».")
             }
             else -> {
-                // Fallback to chef assistant persona
-                val sys = ChatMessage(
-                    "system",
-                    "Ты — дружелюбный шеф-повар и нутриционист. " +
-                            "Если запрос не относится к рецептам/еде/КБЖУ — вежливо подскажи команды /help."
-                )
-                val user = ChatMessage("user", text)
-                val reply = llm.complete(listOf(sys, user))
-                api.sendMessage(chatId, reply)
+                // Free text -> answer according to current persona
+                when (mode[chatId] ?: PersonaMode.CHEF) {
+                    PersonaMode.CHEF -> handleChef(chatId, text)
+                    PersonaMode.CALC -> {
+                        // If not explicitly awaiting input, still treat any free text as input for calculator
+                        handleCalorieInput(chatId, text)
+                    }
+                }
             }
         }
     }
 
-    // ----- Calorie flow via GPT (uses external prompt object) -----
+    // ----- Chef persona -----
+    private fun handleChef(chatId: Long, userText: String) {
+        val sys = ChatMessage("system", PersonaPrompt.system())
+        val user = ChatMessage("user", userText)
+        val reply = llm.complete(listOf(sys, user))
+        api.sendMessage(chatId, reply)
+    }
+
+    // ----- Calorie persona (GPT does all math) -----
     private fun handleCalorieInput(chatId: Long, userText: String) {
         val system = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
         val reply = llm.complete(listOf(system, user))
 
-        // Remove keyboard for clean reading, then clear state
+        // Keep persona CALC until user returns via /recipes or /start,
+        // but remove keyboard for cleaner reading of long answer.
         api.removeKeyboard(chatId, reply)
         state.remove(chatId)
     }
+
+    // ----- UI helpers -----
+    private fun mainKeyboard(): ReplyKeyboardMarkup =
+        ReplyKeyboardMarkup(
+            keyboard = listOf(
+                listOf(KeyboardButton("/recipes")),
+                listOf(KeyboardButton("/caloriecalculator")),
+                listOf(KeyboardButton("/productinfo"), KeyboardButton("/help"))
+            ),
+            resize_keyboard = true,
+            one_time_keyboard = false
+        )
 
     companion object {
         private const val CALORIE_INPUT_PROMPT =
