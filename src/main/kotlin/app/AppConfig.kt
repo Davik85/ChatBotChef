@@ -43,6 +43,8 @@ object AppConfig {
     // Константы
     const val TELEGRAM_BASE = "https://api.telegram.org"
     const val OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+    // Лимит токенов на генерацию (для длинных рецептов)
+    const val OPENAI_MAX_TOKENS = 1800
 
     // Лимиты/тексты
     const val MAX_REPLY_CHARS = 1800
