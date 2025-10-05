@@ -8,10 +8,12 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.time.Duration
 
 private const val TG_LIMIT = 4096
-private const val TG_SAFE_CHUNK = 3500  // keep room for formatting/emoji
+private const val TG_SAFE_CHUNK = 3500
 
 class TelegramApi(private val token: String) {
     private val client = OkHttpClient.Builder()
@@ -27,69 +29,88 @@ class TelegramApi(private val token: String) {
         val url = "${AppConfig.TELEGRAM_BASE}/bot$token/getMe"
         val req = Request.Builder().url(url).get().build()
         client.newCall(req).execute().use { resp ->
-            val raw = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                println("GETME-HTTP-ERR: code=${resp.code} msg=${resp.message} body=$raw"); return false
-            }
-            val parsed: TgApiResp<TgApiUserMe> = mapper.readValue(raw)
-            if (!parsed.ok) {
-                println("GETME-API-ERR: code=${parsed.error_code} desc=${parsed.description}"); return false
-            }
-            val me = parsed.result!!
-            println("GETME: ok id=${me.id} username=@${me.username ?: "unknown"}")
-            return true
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) { println("getMe HTTP ${resp.code}: $body"); return false }
+            val parsed: TgApiResp<TgApiUserMe> = mapper.readValue(body)
+            return parsed.ok
         }
     }
 
-    fun sendMessage(
-        chatId: Long,
-        text: String,
-        parseMode: String? = null,
-        replyMarkup: ReplyMarkup? = null
-    ): Boolean {
+    /** ВАЖНО: гарантируем получение callback_query через allowed_updates */
+    fun getUpdates(offset: Long?): List<TgUpdate> {
+        val base = "${AppConfig.TELEGRAM_BASE}/bot$token/getUpdates"
+        val allowed = URLEncoder.encode("""["message","edited_message","callback_query"]""", StandardCharsets.UTF_8)
+        val url = buildString {
+            append("$base?timeout=25&allowed_updates=$allowed")
+            if (offset != null) append("&offset=$offset")
+        }
+        val req = Request.Builder().url(url).get().build()
+        client.newCall(req).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) { println("getUpdates HTTP ${resp.code}: $body"); return emptyList() }
+            val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(body)
+            if (!parsed.ok) { println("getUpdates API ${parsed.error_code}: ${parsed.description}"); return emptyList() }
+            return parsed.result ?: emptyList()
+        }
+    }
+
+    fun sendMessage(chatId: Long, text: String, parseMode: String? = null, replyMarkup: ReplyMarkup? = null): Boolean {
         var ok = true
         for (chunk in chunks(text)) {
-            val payload = mapper.writeValueAsString(
-                TgSendMessage(chat_id = chatId, text = chunk, parse_mode = parseMode, reply_markup = replyMarkup)
-            )
+            val payload = mapper.writeValueAsString(TgSendMessage(chat_id = chatId, text = chunk, parse_mode = parseMode, reply_markup = replyMarkup))
             val req = Request.Builder()
                 .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendMessage")
                 .post(payload.toRequestBody(json))
                 .build()
             client.newCall(req).execute().use { resp ->
-                val body = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    ok = false; println("SEND-ERR: code=${resp.code} msg=${resp.message} body=$body")
-                } else {
-                    println("SEND: 200 len=${chunk.length}")
-                }
+                val b = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) { ok = false; println("sendMessage HTTP ${resp.code}: $b") }
             }
         }
         return ok
     }
 
-    fun removeKeyboard(chatId: Long, text: String) =
-        sendMessage(chatId, text, parseMode = null, replyMarkup = ReplyKeyboardRemove())
+    fun answerCallback(callbackId: String, text: String? = null) {
+        val body = buildMap<String, Any?> {
+            put("callback_query_id", callbackId)
+            if (!text.isNullOrBlank()) put("text", text)
+        }
+        val req = Request.Builder()
+            .url("${AppConfig.TELEGRAM_BASE}/bot$token/answerCallbackQuery")
+            .post(Json.mapper.writeValueAsString(body).toRequestBody(json))
+            .build()
+        client.newCall(req).execute().use { }
+    }
 
-    // Smart chunking: prefer section boundaries, keep safe size
+    /** Снимаем инлайн-клавиатуру у конкретного сообщения (чтобы меню исчезло) */
+    fun deleteInlineKeyboard(chatId: Long, messageId: Int) {
+        val body = mapOf(
+            "chat_id" to chatId,
+            "message_id" to messageId,
+            "reply_markup" to mapOf("inline_keyboard" to emptyList<List<Any>>())
+        )
+        val req = Request.Builder()
+            .url("${AppConfig.TELEGRAM_BASE}/bot$token/editMessageReplyMarkup")
+            .post(Json.mapper.writeValueAsString(body).toRequestBody(json))
+            .build()
+        client.newCall(req).execute().use { }
+    }
+
     private fun chunks(s: String): List<String> {
         if (s.length <= TG_LIMIT) return listOf(s)
         val parts = mutableListOf<String>()
-        val separators = listOf("\n---\n", "\n\n", "\n")
-        var remaining = s
-        while (remaining.length > TG_SAFE_CHUNK) {
+        val seps = listOf("\n---\n", "\n\n", "\n")
+        var rest = s
+        while (rest.length > TG_SAFE_CHUNK) {
             var cut = TG_SAFE_CHUNK
-            for (sep in separators) {
-                val idx = remaining.lastIndexOf(sep, TG_SAFE_CHUNK)
-                if (idx >= 0 && idx >= TG_SAFE_CHUNK - 400) {
-                    cut = idx + sep.length
-                    break
-                }
+            for (sep in seps) {
+                val idx = rest.lastIndexOf(sep, TG_SAFE_CHUNK)
+                if (idx >= 0 && idx >= TG_SAFE_CHUNK - 400) { cut = idx + sep.length; break }
             }
-            parts += remaining.substring(0, cut)
-            remaining = remaining.substring(cut)
+            parts += rest.substring(0, cut)
+            rest = rest.substring(cut)
         }
-        if (remaining.isNotEmpty()) parts += remaining
+        if (rest.isNotEmpty()) parts += rest
         return parts
     }
 }
