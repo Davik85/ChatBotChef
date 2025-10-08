@@ -7,6 +7,7 @@ build/
 bot.db
 .env
 ChatBotChef.bundle
+ChatBotChef.iml
 
 ### IntelliJ IDEA ###
 .idea/*
@@ -48,3 +49,12 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+# Local data & DB
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
