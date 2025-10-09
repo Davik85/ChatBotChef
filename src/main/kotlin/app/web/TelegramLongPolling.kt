@@ -10,11 +10,10 @@ import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
 import kotlinx.coroutines.delay
-import kotlin.text.trimIndent
 
 /**
- * Меню показываем только на /start. После клика по кнопке:
- * answerCallbackQuery + editMessageReplyMarkup (убираем меню) + переключение роли.
+ * Меню показываем только на /start. После клика меню скрываем.
+ * Русские тексты НЕ меняем.
  */
 class TelegramLongPolling(
     private val token: String,
@@ -35,19 +34,20 @@ class TelegramLongPolling(
         private const val CB_HELP = "menu_help"
 
         private const val START_GREETING_RU =
-            "Привет! Я шеф-повар-бот.\n\nВыбери режим ниже: рецепты, калькулятор калорий или КБЖУ ингредиента."
+            "Привет! Начнем?"
 
-        private val CALORIE_INPUT_PROMPT ="""
-                Пришли в одном сообщении: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), сколько шагов в день и сколько тренировок в неделю, цель (похудеть/набрать массу). 
-             
-                Пример: «мужчина, 40 лет, 175 см, 80 кг, активный, 9000 шагов, 4 тренировки в неделю, цель похудеть».
-                Или вернись к /start для меню.
-                """.trimIndent()
+        private val CALORIE_INPUT_PROMPT = """
+            Пришли в одном сообщении: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), сколько шагов в день и сколько тренировок в неделю, цель (похудеть/набрать массу). 
+            
+            Пример: «мужчина, 40 лет, 175 см, 80 кг, активный, 9000 шагов, 4 тренировки в неделю, цель похудеть».
+            Или вернись к /start для меню.
+        """.trimIndent()
 
-        private  val PRODUCT_INPUT_PROMPT ="""
+        private val PRODUCT_INPUT_PROMPT = """
             Пришли название ингредиента (можно с уточнением части/жирности и способа приготовления). 
             Примеры:«свинина шея», «лосось сырой», «куриная грудка без кожи», «рис отварной», «сыр моцарелла».
-            Или вернись к /start для меню.""".trimIndent()
+            Или вернись к /start для меню.
+        """.trimIndent()
 
         private val CHEF_INPUT_PROMPT = """
             Напиши продукты и условия (прием пищи, техника, диета). 
@@ -57,6 +57,30 @@ class TelegramLongPolling(
             
             Или вернись к /start для меню.
         """.trimIndent()
+
+        private val HELP_TEXT = """
+            Помогу с идеями блюд, подсчётом калорий и КБЖУ ингредиентов.
+
+            Доступные команды:
+            • /recipes — режим «Рецепты». Напиши продукты и условия (приём пищи, техника, диета).
+              Пример: «ужин, курица, рис, брокколи, запечь в духовке».
+            • /caloriecalculator — рассчёт КБЖУ и калорий под цель.
+              Формат: пол, возраст, рост (см), вес (кг), образ жизни (пассивный/активный), шаги/день, тренировки/неделю, цель.
+              Пример: «женщина, 30 лет, 165 см, 62 кг, пассивный, 4000 шагов, 2 тренировки, цель набрать массу/похудеть».
+            • /productinfo — КБЖУ конкретного ингредиента.
+              Пример: «свинина шея», «лосось сырой», «рис отварной», «моцарелла».
+            • /start — открыть стартовое меню.
+
+            Подсказки:
+            • Можно писать одним сообщением и без формальностей — я пойму.
+            • Для рецептов укажи ограничения (например, «без молочного», «до 30 минут», «мультиварка»).
+            • Вернуться в меню — команда /start.
+
+            Сайт: добавим позже.
+        """.trimIndent()
+
+        /** Путь к файлу в ресурсах: src/main/resources/welcome/start.jpg */
+        private const val START_IMAGE_RES = "welcome/start.jpg"
     }
 
     suspend fun run() {
@@ -72,18 +96,12 @@ class TelegramLongPolling(
                     offset = u.update_id + 1
 
                     val cb: TgCallbackQuery? = u.callback_query
-                    if (cb != null) {
-                        println("CB <<< chat=${cb.message?.chat?.id} data=${cb.data}")
-                        handleCallback(cb)
-                        continue
-                    }
+                    if (cb != null) { handleCallback(cb); continue }
 
-                    val msg = u.message ?: u.edited_message
-                    if (msg == null) continue
+                    val msg = u.message ?: u.edited_message ?: continue
                     val text = msg.text?.trim().orEmpty()
                     if (text.isBlank()) continue
 
-                    println("MSG <<< chat=${msg.chat.id} text=$text")
                     route(msg.chat.id, text)
                 }
             } catch (t: Throwable) {
@@ -93,7 +111,6 @@ class TelegramLongPolling(
         }
     }
 
-    // ----- CALLBACKS -----
     private fun handleCallback(cb: TgCallbackQuery) {
         val chatId = cb.message?.chat?.id ?: return
         val msgId = cb.message.message_id
@@ -123,30 +140,19 @@ class TelegramLongPolling(
             CB_HELP -> {
                 api.answerCallback(cb.id)
                 api.deleteInlineKeyboard(chatId, msgId)
-                api.sendMessage(
-                    chatId,
-                    "Помощь:\n/recipes — рецепты\n/caloriecalculator — калькулятор калорий\n/productinfo — КБЖУ ингредиента\n/start — показать меню."
-                )
-            }
-            else -> {
-                api.answerCallback(cb.id)
-                api.deleteInlineKeyboard(chatId, msgId)
-                api.sendMessage(chatId, "Неизвестная кнопка. Напишите /start для меню.")
+                api.sendMessage(chatId, HELP_TEXT)
             }
         }
     }
 
-    // ----- TEXT ROUTER -----
     private fun route(chatId: Long, text: String) {
         val lower = text.lowercase()
 
         when (state[chatId]) {
-            BotState.AWAITING_CALORIE_INPUT -> {
+            BotState.AWAITING_CALORIE_INPUT ->
                 if (!lower.startsWith("/")) { handleCalorieInput(chatId, text); return }
-            }
-            BotState.AWAITING_PRODUCT_INPUT -> {
+            BotState.AWAITING_PRODUCT_INPUT ->
                 if (!lower.startsWith("/")) { handleProductInput(chatId, text); return }
-            }
             else -> {}
         }
 
@@ -154,7 +160,13 @@ class TelegramLongPolling(
             "/start" -> {
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
-                api.sendMessage(chatId, START_GREETING_RU, replyMarkup = inlineMenu()) // меню только тут
+                // Вместо текста — локальная картинка + подпись + инлайн-меню
+                api.sendPhotoResource(
+                    chatId = chatId,
+                    resourcePath = START_IMAGE_RES,
+                    caption = START_GREETING_RU,
+                    replyMarkup = inlineMenu()
+                )
             }
             "/recipes" -> {
                 mode[chatId] = PersonaMode.CHEF
@@ -171,23 +183,15 @@ class TelegramLongPolling(
                 state[chatId] = BotState.AWAITING_PRODUCT_INPUT
                 api.sendMessage(chatId, PRODUCT_INPUT_PROMPT)
             }
-            "/help" -> {
-                api.sendMessage(
-                    chatId,
-                    "Помощь:\n/recipes — рецепты\n/caloriecalculator — калькулятор калорий\n/productinfo — КБЖУ ингредиента\n/start — показать меню."
-                )
-            }
-            else -> {
-                when (mode[chatId] ?: PersonaMode.CHEF) {
-                    PersonaMode.CHEF -> handleChef(chatId, text)
-                    PersonaMode.CALC -> handleCalorieInput(chatId, text)
-                    PersonaMode.PRODUCT -> handleProductInput(chatId, text)
-                }
+            "/help" -> api.sendMessage(chatId, HELP_TEXT)
+            else -> when (mode[chatId] ?: PersonaMode.CHEF) {
+                PersonaMode.CHEF -> handleChef(chatId, text)
+                PersonaMode.CALC -> handleCalorieInput(chatId, text)
+                PersonaMode.PRODUCT -> handleProductInput(chatId, text)
             }
         }
     }
 
-    // ----- Personas -----
     private fun handleChef(chatId: Long, userText: String) {
         val sys = ChatMessage("system", PersonaPrompt.system())
         val user = ChatMessage("user", userText)
@@ -196,22 +200,21 @@ class TelegramLongPolling(
     }
 
     private fun handleCalorieInput(chatId: Long, userText: String) {
-        val system = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
+        val sys = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
-        val reply = llm.complete(listOf(system, user))
+        val reply = llm.complete(listOf(sys, user))
         api.sendMessage(chatId, reply)
         state.remove(chatId)
     }
 
     private fun handleProductInput(chatId: Long, userText: String) {
-        val system = ChatMessage("system", ProductInfoPrompt.SYSTEM)
+        val sys = ChatMessage("system", ProductInfoPrompt.SYSTEM)
         val user = ChatMessage("user", "Ингредиент: $userText")
-        val reply = llm.complete(listOf(system, user))
+        val reply = llm.complete(listOf(sys, user))
         api.sendMessage(chatId, reply)
         state.remove(chatId)
     }
 
-    // Инлайн-меню (только на /start)
     private fun inlineMenu(): InlineKeyboardMarkup =
         InlineKeyboardMarkup(
             inline_keyboard = listOf(
