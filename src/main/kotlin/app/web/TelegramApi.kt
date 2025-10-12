@@ -35,7 +35,8 @@ class TelegramApi(private val token: String) {
         client.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                println("getMe HTTP ${resp.code}: $body"); return false
+                println("getMe HTTP ${resp.code}: $body")
+                return false
             }
             val parsed: TgApiResp<TgApiUserMe> = mapper.readValue(body)
             return parsed.ok
@@ -53,11 +54,13 @@ class TelegramApi(private val token: String) {
         client.newCall(req).execute().use { resp ->
             val body = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                println("getUpdates HTTP ${resp.code}: $body"); return emptyList()
+                println("getUpdates HTTP ${resp.code}: $body")
+                return emptyList()
             }
             val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(body)
             if (!parsed.ok) {
-                println("getUpdates API ${parsed.error_code}: ${parsed.description}"); return emptyList()
+                println("getUpdates API ${parsed.error_code}: ${parsed.description}")
+                return emptyList()
             }
             return parsed.result ?: emptyList()
         }
@@ -81,37 +84,12 @@ class TelegramApi(private val token: String) {
             client.newCall(req).execute().use { resp ->
                 val b = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    ok = false; println("sendMessage HTTP ${resp.code}: $b")
+                    ok = false
+                    println("sendMessage HTTP ${resp.code}: $b")
                 }
             }
         }
         return ok
-    }
-
-    /** Фото по HTTPS-URL или file_id (остаётся для совместимости). */
-    fun sendPhotoUrl(
-        chatId: Long,
-        photoUrlOrFileId: String,
-        caption: String? = null,
-        replyMarkup: ReplyMarkup? = null
-    ): Boolean {
-        val body = buildMap<String, Any?> {
-            put("chat_id", chatId)
-            put("photo", photoUrlOrFileId)
-            if (!caption.isNullOrBlank()) put("caption", caption)
-            if (replyMarkup != null) put("reply_markup", replyMarkup)
-        }
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendPhoto")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            val b = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                println("sendPhotoUrl HTTP ${resp.code}: $b"); return false
-            }
-        }
-        return true
     }
 
     /** Фото локальным файлом (multipart/form-data). */
@@ -144,12 +122,12 @@ class TelegramApi(private val token: String) {
         client.newCall(req).execute().use { resp ->
             val b = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) {
-                println("sendPhotoFile HTTP ${resp.code}: $b"); return false
+                println("sendPhotoFile HTTP ${resp.code}: $b")
+                return false
             }
         }
         return true
     }
-
 
     fun sendPhotoResource(
         chatId: Long,
@@ -160,13 +138,11 @@ class TelegramApi(private val token: String) {
         val loader = Thread.currentThread().contextClassLoader
         val url = loader.getResource(resourcePath)
         return if (url != null) {
-// Копировать файл не обязательно — OkHttp умеет читать по File, проще записать во временный файл.
             val tmp = File.createTempFile("tg_photo_", "_" + File(resourcePath).name)
             tmp.outputStream().use { out -> url.openStream().use { it.copyTo(out) } }
             tmp.deleteOnExit()
             sendPhotoFile(chatId, tmp.absolutePath, caption, replyMarkup)
         } else {
-// Фоллбек: путь на диске
             sendPhotoFile(chatId, resourcePath, caption, replyMarkup)
         }
     }
@@ -183,6 +159,35 @@ class TelegramApi(private val token: String) {
         client.newCall(req).execute().use { }
     }
 
+    /** Удалить сообщение (для очистки стартового баннера). */
+    fun deleteMessage(chatId: Long, messageId: Int): Boolean {
+        val body = mapOf("chat_id" to chatId, "message_id" to messageId)
+        val req = Request.Builder()
+            .url("${AppConfig.TELEGRAM_BASE}/bot$token/deleteMessage")
+            .post(Json.mapper.writeValueAsString(body).toRequestBody(json))
+            .build()
+        client.newCall(req).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                println("deleteMessage HTTP ${resp.code}: $raw")
+                return false
+            }
+// deleteMessage может вернуть {"ok":true,"result":true} — result это Boolean.
+// Парсим как дерево и смотрим только на ok.
+            val node = try {
+                mapper.readTree(raw)
+            } catch (_: Throwable) {
+                null
+            }
+            val okFlag = node?.get("ok")?.asBoolean() ?: true // некоторые обёртки возвращают пусто; считаем 200 как ок
+            if (!okFlag) {
+                println("deleteMessage API not ok: $raw")
+            }
+            return okFlag
+        }
+    }
+
+    /** Фолбэк: убрать только клавиатуру у сообщения. */
     fun deleteInlineKeyboard(chatId: Long, messageId: Int) {
         val body = mapOf(
             "chat_id" to chatId,
