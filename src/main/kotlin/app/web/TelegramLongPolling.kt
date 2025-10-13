@@ -9,7 +9,9 @@ import app.web.dto.InlineKeyboardButton
 import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
+import app.web.dto.* // для TgUser/TgMessage (from, reply_to_message)
 import kotlinx.coroutines.delay
+import app.db.PremiumRepo
 
 /**
  * Меню показываем только на /start. После клика меню/баннер удаляем.
@@ -112,6 +114,13 @@ class TelegramLongPolling(
 
         /** Путь к файлу: src/main/resources/welcome/start.jpg */
         private const val START_IMAGE_RES = "welcome/start.jpg"
+
+        /** Список админов (через запятую) из ENV: ADMIN_IDS=123,456 */
+        private val ADMIN_IDS: Set<Long> =
+            (System.getenv("ADMIN_IDS") ?: "")
+                .split(",")
+                .mapNotNull { it.trim().toLongOrNull() }
+                .toSet()
     }
 
     suspend fun run() {
@@ -137,8 +146,8 @@ class TelegramLongPolling(
                     val text = msg.text?.trim().orEmpty()
                     if (text.isBlank()) continue
 
-                    // передаём и message_id, чтобы можно было удалить /start
-                    route(msg.chat.id, msg.message_id, text)
+                    // Передаём весь msg, чтобы видеть from и reply_to_message
+                    route(msg)
                 }
             } catch (t: Throwable) {
                 println("POLLING-ERR: ${t.message}")
@@ -188,24 +197,77 @@ class TelegramLongPolling(
         }
     }
 
-    // изменил сигнатуру: добавлен msgId
-    private fun route(chatId: Long, msgId: Int, text: String) {
-        val lower = text.lowercase()
+    // Новый роутер принимает целый TgMessage, чтобы использовать from/reply_to_message
+    private fun route(msg: TgMessage) {
+        val chatId = msg.chat.id
+        val msgId = msg.message_id
+        val fromId = msg.from?.id
+        val lower = msg.text?.lowercase().orEmpty()
 
+        // ===== Админ-команды =====
+        if (lower.startsWith("/whoami")) {
+            api.sendMessage(chatId, "Ваш Telegram ID: ${fromId ?: "неизвестен"}")
+            return
+        }
+
+        if (lower.startsWith("/grantpremium")) {
+            if (fromId !in ADMIN_IDS) {
+                api.sendMessage(chatId, "Недостаточно прав.")
+                return
+            }
+            val parts = msg.text!!.trim().split(Regex("\\s+"))
+            when {
+                // Вариант 1: в ответ на сообщение пользователя — /grantpremium <days>
+                msg.reply_to_message != null && parts.size == 2 -> {
+                    val days = parts[1].toIntOrNull()
+                    val targetId = msg.reply_to_message.from?.id
+                    if (days == null || days <= 0 || targetId == null) {
+                        api.sendMessage(chatId, "Формат (по reply): /grantpremium <days>")
+                        return
+                    }
+                    PremiumRepo.grantDays(targetId, days)
+                    val until = PremiumRepo.getUntil(targetId)
+                    val untilStr = until?.let { java.time.Instant.ofEpochMilli(it).toString() } ?: "—"
+                    api.sendMessage(chatId, "Ок. Пользователь $targetId получил премиум на $days дн. До: $untilStr")
+                }
+
+                // Вариант 2: напрямую — /grantpremium <userId> <days>
+                parts.size >= 3 -> {
+                    val target = parts[1].toLongOrNull()
+                    val days = parts[2].toIntOrNull()
+                    if (target == null || days == null || days <= 0) {
+                        api.sendMessage(chatId, "Формат: /grantpremium <userId> <days>")
+                        return
+                    }
+                    PremiumRepo.grantDays(target, days)
+                    val until = PremiumRepo.getUntil(target)
+                    val untilStr = until?.let { java.time.Instant.ofEpochMilli(it).toString() } ?: "—"
+                    api.sendMessage(chatId, "Ок. Пользователь $target получил премиум на $days дн. До: $untilStr")
+                }
+
+                else -> {
+                    api.sendMessage(chatId, "Форматы:\n— по reply: /grantpremium <days>\n— напрямую: /grantpremium <userId> <days>")
+                }
+            }
+            return
+        }
+
+        // ===== Ожидание данных в режимах =====
         when (state[chatId]) {
             BotState.AWAITING_CALORIE_INPUT ->
                 if (!lower.startsWith("/")) {
-                    handleCalorieInput(chatId, text); return
+                    handleCalorieInput(chatId, msg.text ?: ""); return
                 }
 
             BotState.AWAITING_PRODUCT_INPUT ->
                 if (!lower.startsWith("/")) {
-                    handleProductInput(chatId, text); return
+                    handleProductInput(chatId, msg.text ?: ""); return
                 }
 
             else -> {}
         }
 
+        // ===== Обычные команды =====
         when (lower) {
             "/start" -> {
                 // удаляем сообщение пользователя с командой /start
@@ -240,10 +302,11 @@ class TelegramLongPolling(
             }
 
             "/help" -> api.sendMessage(chatId, HELP_TEXT)
+
             else -> when (mode[chatId] ?: PersonaMode.CHEF) {
-                PersonaMode.CHEF -> handleChef(chatId, text)
-                PersonaMode.CALC -> handleCalorieInput(chatId, text)
-                PersonaMode.PRODUCT -> handleProductInput(chatId, text)
+                PersonaMode.CHEF -> handleChef(chatId, msg.text ?: "")
+                PersonaMode.CALC -> handleCalorieInput(chatId, msg.text ?: "")
+                PersonaMode.PRODUCT -> handleProductInput(chatId, msg.text ?: "")
             }
         }
     }
@@ -276,11 +339,8 @@ class TelegramLongPolling(
             inline_keyboard = listOf(
                 listOf(InlineKeyboardButton("Рецепты", CB_RECIPES)),
                 listOf(InlineKeyboardButton("Калькулятор калорий", CB_CALC)),
-                list_of(InlineKeyboardButton("КБЖУ ингредиента", CB_PRODUCT)),
+                listOf(InlineKeyboardButton("КБЖУ ингредиента", CB_PRODUCT)),
                 listOf(InlineKeyboardButton("Помощь", CB_HELP))
             )
         )
-
-    // маленькая опечаточная страховка (старый вызов мог остаться в IDE)
-    private fun list_of(button: InlineKeyboardButton) = listOf(button)
 }
