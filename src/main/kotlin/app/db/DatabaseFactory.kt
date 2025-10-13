@@ -157,12 +157,4 @@ object ProcessedUpdatesRepo {
     }
 }
 
-object PremiumRepo {
-    fun isPremium(userId: Long): Boolean = transaction {
-        Users
-            .select { Users.id eq userId }
-            .firstOrNull()
-            ?.get(Users.isPremiumUntil)
-            ?.let { it > System.currentTimeMillis() } == true
-    }
-}
+
