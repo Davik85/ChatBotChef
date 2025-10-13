@@ -6,8 +6,8 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.SchemaUtils.createMissingTablesAndColumns
 
 /**
- * Лёгкий репозиторий для премиума.
- * Сам поднимет таблицу premium_users при первом вызове любого метода.
+ * Репозиторий премиума в отдельной таблице premium_users.
+ * Сам инициирует таблицу при первом вызове любого метода.
  */
 object PremiumRepo {
 
@@ -17,14 +17,14 @@ object PremiumRepo {
         override val primaryKey = PrimaryKey(userId, name = "pk_premium_users")
     }
 
-    /** Ленивая инициализация таблицы (если DatabaseFactory.init() уже вызван — всё ок). */
+    /** Ленивая инициализация таблицы (если DatabaseFactory.init() уже вызван — ок). */
     private fun ensure() {
         transaction {
             createMissingTablesAndColumns(PremiumUsers)
         }
     }
 
-    /** Установить премиум до абсолютного времени (ms epoch). */
+    /** Установить премиум до абсолютного времени (мс epoch). */
     fun setUntil(userId: Long, untilEpochMs: Long) {
         ensure()
         transaction {
@@ -42,7 +42,7 @@ object PremiumRepo {
         }
     }
 
-    /** Выдать премиум на days дней, начиная с текущего момента (или продлить, если уже есть). */
+    /** Выдать премиум на days дней (продлевает, если уже активен). */
     fun grantDays(userId: Long, days: Int) {
         ensure()
         val addMs = days.toLong() * 24 * 60 * 60 * 1000
@@ -64,7 +64,7 @@ object PremiumRepo {
         }
     }
 
-    /** Проверить активен ли премиум (на момент вызова). */
+    /** Премиум активен на текущий момент? */
     fun isActive(userId: Long): Boolean {
         ensure()
         return transaction {
@@ -78,7 +78,7 @@ object PremiumRepo {
         }
     }
 
-    /** Получить срок окончания (или null, если нет записи). */
+    /** Вернуть время окончания (мс epoch) или null. */
     fun getUntil(userId: Long): Long? {
         ensure()
         return transaction {
