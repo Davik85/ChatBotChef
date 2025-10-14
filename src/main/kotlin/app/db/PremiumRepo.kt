@@ -4,23 +4,36 @@ import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.SchemaUtils.createMissingTablesAndColumns
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Репозиторий премиума в отдельной таблице premium_users.
- * Сам инициирует таблицу при первом вызове любого метода.
+ * Репозиторий премиума в таблице premium_users.
+ * Чинит дублирующийся индекс: больше НЕТ uniqueIndex на user_id — только PRIMARY KEY.
+ * При первой инициализации пытается дропнуть старый индекс premium_users_user_id_unique.
  */
 object PremiumRepo {
 
     private object PremiumUsers : Table("premium_users") {
-        val userId = long("user_id").uniqueIndex("premium_users_user_id_unique")
+        // Было: uniqueIndex("premium_users_user_id_unique") — УДАЛЕНО.
+        val userId = long("user_id")
         val untilMs = long("until_ms").index("premium_users_until_ms_idx")
         override val primaryKey = PrimaryKey(userId, name = "pk_premium_users")
     }
 
-    /** Ленивая инициализация таблицы (если DatabaseFactory.init() уже вызван — ок). */
+    private val inited = AtomicBoolean(false)
+
+    /** Ленивая инициализация таблицы + миграция (дроп лишнего индекса, если остался). */
     private fun ensure() {
-        transaction {
-            createMissingTablesAndColumns(PremiumUsers)
+        if (inited.compareAndSet(false, true)) {
+            transaction {
+                // Дроп legacy-индекса, который дублирует PRIMARY KEY:
+                try {
+                    exec("DROP INDEX IF EXISTS premium_users_user_id_unique")
+                } catch (_: Throwable) {
+                    // ничего страшного, просто продолжаем
+                }
+                createMissingTablesAndColumns(PremiumUsers)
+            }
         }
     }
 
