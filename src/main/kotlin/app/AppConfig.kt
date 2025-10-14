@@ -48,7 +48,7 @@ object AppConfig {
 
     // Лимиты/тексты
     const val MAX_REPLY_CHARS = 1800
-    const val FREE_DAILY_MSG_LIMIT = 200
+    const val FREE_DAILY_MSG_LIMIT = 3
 
     // Ссылка на оплату (замени на свою)
     val SUBSCRIBE_URL: String by lazy { clean(readRaw("SUBSCRIBE_URL")) ?: "https://example.com/pay" }
@@ -56,7 +56,8 @@ object AppConfig {
     // Paywall-текст (видит только исчерпавший лимит)
     val PAYWALL_TEXT: String get() =
         "Лимит бесплатных сообщений исчерпан. " +
-                "Оформи подписку и создавай рецепты без ограничений!"
+                "Оформи подписку и создавай рецепты без ограничений! 700рублей в месяц. " +
+                "Подписаться: $SUBSCRIBE_URL"
 
     // Fallback (видит только при ошибке LLM)
     const val FALLBACK_REPLY =
