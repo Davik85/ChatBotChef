@@ -12,7 +12,8 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-core:0.53.0")
     implementation("org.jetbrains.exposed:exposed-dao:0.53.0")
     implementation("org.jetbrains.exposed:exposed-jdbc:0.53.0")
-    implementation("org.xerial:sqlite-jdbc:3.46.0.0")
+    implementation("org.xerial:sqlite-jdbc:3.45.3.0")
+
 
     // HTTP + JSON + .env
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

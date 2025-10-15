@@ -1,58 +1,46 @@
 package app.logic
 
 import app.db.MemoryNotesV2
-import app.db.Messages
 import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.transactions.transaction
 
 object MemoryService {
 
+    /** Вернуть сохранённую заметку пользователя или null. */
     fun getNote(userId: Long): String? = transaction {
         MemoryNotesV2
             .slice(MemoryNotesV2.note)
-            .select { MemoryNotesV2.userId eq userId }
+            .select { MemoryNotesV2.user_id eq userId }
+            .limit(1)
             .firstOrNull()
             ?.get(MemoryNotesV2.note)
     }
 
+    /** Сохранить/обновить заметку пользователя. */
     fun setNote(userId: Long, note: String) = transaction {
         val exists = MemoryNotesV2
-            .slice(MemoryNotesV2.userId)
-            .select { MemoryNotesV2.userId eq userId }
+            .slice(MemoryNotesV2.user_id)
+            .select { MemoryNotesV2.user_id eq userId }
             .limit(1)
             .any()
 
         if (exists) {
-            MemoryNotesV2.update({ MemoryNotesV2.userId eq userId }) {
+            MemoryNotesV2.update({ MemoryNotesV2.user_id eq userId }) {
                 it[MemoryNotesV2.note] = note
-                it[MemoryNotesV2.updatedAt] = System.currentTimeMillis()
+                it[MemoryNotesV2.ts] = System.currentTimeMillis()
             }
         } else {
             MemoryNotesV2.insert {
-                it[MemoryNotesV2.userId] = userId
+                it[MemoryNotesV2.user_id] = userId
                 it[MemoryNotesV2.note] = note
-                it[MemoryNotesV2.updatedAt] = System.currentTimeMillis()
+                it[MemoryNotesV2.ts] = System.currentTimeMillis()
             }
         }
     }
 
-    fun append(userId: Long, role: String, content: String, ts: Long) = transaction {
-        Messages.insert {
-            it[Messages.userId] = userId
-            it[Messages.role] = role
-            it[Messages.content] = content
-            it[Messages.ts] = ts
-        }
-    }
-
-    /** Возвращает последние N реплик диалога в виде пар (role, content) */
-    fun recentDialog(userId: Long, limit: Int = 10): List<Pair<String, String>> = transaction {
-        Messages
-            .slice(Messages.role, Messages.content)
-            .select { Messages.userId eq userId }
-            .orderBy(Messages.ts, SortOrder.DESC)
-            .limit(limit)
-            .map { it[Messages.role] to it[Messages.content] }
-            .reversed() // хронологический порядок
+    /** Удалить заметку пользователя. */
+    fun clearNote(userId: Long) = transaction {
+        MemoryNotesV2.deleteWhere { MemoryNotesV2.user_id eq userId }
     }
 }
