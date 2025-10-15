@@ -82,7 +82,12 @@ class TelegramApi(private val token: String) {
         }
     }
 
-    fun sendPhotoResource(chatId: Long, resourcePath: String, caption: String? = null, replyMarkup: InlineKeyboardMarkup? = null): Int? {
+    fun sendPhotoResource(
+        chatId: Long,
+        resourcePath: String,
+        caption: String? = null,
+        replyMarkup: InlineKeyboardMarkup? = null
+    ): Int? {
         val stream = Thread.currentThread().contextClassLoader.getResourceAsStream(resourcePath)
             ?: return sendMessage(chatId, caption ?: "")
         val tmp = File.createTempFile("tg-photo-", ".jpg").apply { deleteOnExit() }
@@ -128,7 +133,7 @@ class TelegramApi(private val token: String) {
         needPhone: Boolean = false,
         sendEmailToProvider: Boolean = false,
         sendPhoneToProvider: Boolean = false,
-        providerData: Map<String, Any>? = null, // <<< ЧЕК 54-ФЗ
+        providerData: Map<String, Any>? = null,
     ): Boolean {
         val args = mutableMapOf<String, Any>(
             "chat_id" to chatId,
