@@ -253,11 +253,44 @@ class TelegramLongPolling(
     private fun route(msg: TgMessage) {
         val chatId = msg.chat.id
         val msgId = msg.message_id
-        val fromId = msg.from?.id
+        val userId = msg.from?.id ?: chatId // в личке chatId == userId
         val lower = msg.text?.lowercase().orEmpty()
 
+        // ----- ADMIN COMMANDS -----
+        if (lower.startsWith("/premiumstatus")) {
+            if (!isAdmin(userId)) {
+                api.sendMessage(chatId, "Команда доступна только админам."); return
+            }
+            val parts = lower.split(" ").filter { it.isNotBlank() }
+            val target = parts.getOrNull(1)?.toLongOrNull() ?: userId
+            val until = PremiumRepo.getUntil(target)
+            val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "нет подписки"
+            api.sendMessage(chatId, "Premium для $target: $untilStr")
+            return
+        }
+
+        if (lower.startsWith("/grantpremium")) {
+            if (!isAdmin(userId)) {
+                api.sendMessage(chatId, "Команда доступна только админам."); return
+            }
+            val parts = lower.split(" ").filter { it.isNotBlank() }
+            val target = parts.getOrNull(1)?.toLongOrNull()
+            val days = parts.getOrNull(2)?.toIntOrNull()
+            if (target == null || days == null || days <= 0) {
+                api.sendMessage(chatId, "Использование: /grantpremium <tgId> <days>")
+                return
+            }
+            PremiumRepo.grantDays(target, days)
+            val until = PremiumRepo.getUntil(target)
+            val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+            api.sendMessage(chatId, "Выдан премиум пользователю $target на $days дн. До: $untilStr")
+            return
+        }
+
+        // ----- PUBLIC COMMANDS -----
+
         if (lower.startsWith("/whoami")) {
-            api.sendMessage(chatId, "Ваш Telegram ID: ${fromId ?: "неизвестен"}")
+            api.sendMessage(chatId, "Ваш Telegram ID: $userId")
             return
         }
 
