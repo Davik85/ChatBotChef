@@ -10,18 +10,15 @@ import app.web.dto.InlineKeyboardButton
 import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
-import app.web.dto.* // для TgUser/TgMessage (from, reply_to_message)
+import app.web.dto.*
 import kotlinx.coroutines.delay
 import app.db.PremiumRepo
 import app.logic.RateLimiter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
-/**
- * Меню показываем только на /start. После клика меню/баннер удаляем.
- * Теперь также удаляем и само командное сообщение /start.
- */
 class TelegramLongPolling(
     private val token: String,
     private val llm: OpenAIClient
@@ -39,6 +36,7 @@ class TelegramLongPolling(
         private const val CB_CALC = "menu_calc"
         private const val CB_PRODUCT = "menu_product"
         private const val CB_HELP = "menu_help"
+        private const val CB_PAY_NOW = "menu_pay_now"
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Меня зовут Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -68,13 +66,9 @@ class TelegramLongPolling(
             Примеры:
            
             — свинина шея
-           
             — лосось сырой
-           
             — куриная грудка без кожи
-          
             — рис отварной
-           
             — сыр моцарелла
            
             ☝Хотите вернуться к главному меню? Просто введите команду /start!
@@ -93,34 +87,17 @@ class TelegramLongPolling(
             💡 Привет! Хочешь узнать обо всём, что я умею?Здесь я расскажу, какие фишки спрятаны внутри меня и как ими пользоваться. Всё предельно просто и быстро!
 
             Доступные команды:
-            
             ✨ /recipes — Подберу идеальный рецепт
-           
-            Пришли список продуктов и предпочтения (приём пищи, технику приготовления, диету).Пример: ужин, курица, рис, брокколи, запечь в духовке.
-            
             ⚖️ /caloriecalculator — Рассчитаю персональную норму КБЖУ и калорий
-            
-            Отправь мне данные: пол, возраст, рост, вес, активность, шаги в день, тренировки в неделю и цель (похудеть/набрать массу).Пример: женщина, 30 лет, 165 см, 62 кг, пассивный, 4000 шагов, 2 тренировки, цель набрать массу.
-           
             🧂 /productinfo — Узнай КБЖУ любого продукта
-           
-            Сообщи название ингредиента с деталями (часть, жирность, способ приготовления). Пример: свинина шея, лосось сырой, рис отварной, моцарелла.
-          
             🎯 /start — Открою стартовое меню
-            
-            Полезные советы:
-            -	Можно отправлять запросы свободно, без строгого формата — разберусь сам!
-            -	Ограничения для рецепта напиши сразу («без молочного», «быстро», «мультиварка»).
-            -	Главное меню доступно по команде /start.
-            Приятного аппетита и удачных экспериментов! 😊
-            
+
             Сайт проекта:
         """.trimIndent()
 
-        /** Путь к файлу: src/main/resources/welcome/start.jpg */
         private const val START_IMAGE_RES = "welcome/start.jpg"
 
-        /** Список админов (через запятую) из ENV: ADMIN_IDS=123,456 */
+        // Админы читаются из переменной окружения ADMIN_IDS="123,456"
         private val ADMIN_IDS: Set<Long> =
             (System.getenv("ADMIN_IDS") ?: "")
                 .split(",")
@@ -131,6 +108,9 @@ class TelegramLongPolling(
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
     }
 
+    /** True, если пользователь — админ (безлимит, без подписки) */
+    private fun isAdmin(userId: Long): Boolean = ADMIN_IDS.contains(userId)
+
     suspend fun run() {
         require(api.getMe()) { "Telegram getMe failed" }
         var offset: Long? = null
@@ -138,12 +118,15 @@ class TelegramLongPolling(
         while (true) {
             try {
                 val updates: List<TgUpdate> = api.getUpdates(offset)
-                if (updates.isEmpty()) {
-                    delay(1200); continue
-                }
+                if (updates.isEmpty()) { delay(1200); continue }
 
                 for (u in updates) {
                     offset = u.update_id + 1
+
+                    val pcq = u.pre_checkout_query
+                    if (pcq != null) {
+                        handlePreCheckout(pcq); continue
+                    }
 
                     val cb: TgCallbackQuery? = u.callback_query
                     if (cb != null) {
@@ -151,9 +134,14 @@ class TelegramLongPolling(
                     }
 
                     val msg = u.message ?: u.edited_message ?: continue
+
+                    val sp = msg.successful_payment
+                    if (sp != null) {
+                        handleSuccessfulPayment(msg); continue
+                    }
+
                     val text = msg.text?.trim().orEmpty()
                     if (text.isBlank()) continue
-
                     route(msg)
                 }
             } catch (t: Throwable) {
@@ -162,6 +150,59 @@ class TelegramLongPolling(
             }
         }
     }
+
+    // ====== PAYMENTS ======
+
+    private fun handlePreCheckout(q: TgPreCheckoutQuery) {
+        api.answerPreCheckoutQuery(q.id, ok = true)
+    }
+
+    private fun handleSuccessfulPayment(msg: TgMessage) {
+        val chatId = msg.chat.id
+        PremiumRepo.grantDays(chatId, AppConfig.premiumDays)
+        val until = PremiumRepo.getUntil(chatId)
+        val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        api.sendMessage(chatId, "Оплата принята. Премиум активен до: $untilStr")
+    }
+
+    private fun sendTelegramInvoice(chatId: Long): Boolean {
+        val title = "Премиум-доступ на ${AppConfig.premiumDays} дней"
+        val desc = "Доступ ко всем функциям бота без ограничений."
+        val prices = listOf(TgLabeledPrice(label = "Подписка", amount = AppConfig.premiumPriceRub * 100))
+
+        val value = String.format(Locale.US, "%.2f", AppConfig.premiumPriceRub.toDouble())
+        val item = mapOf(
+            "description" to title.take(128),
+            "quantity" to "1.00",
+            "amount" to mapOf("value" to value, "currency" to "RUB"),
+            "vat_code" to AppConfig.vatCode,
+            "payment_mode" to AppConfig.paymentMode,
+            "payment_subject" to AppConfig.paymentSubject
+        )
+        val providerData = mapOf(
+            "receipt" to mapOf(
+                "items" to listOf(item),
+                "tax_system_code" to AppConfig.taxSystemCode
+            )
+        )
+
+        return api.sendInvoice(
+            chatId = chatId,
+            title = title,
+            description = desc,
+            payload = "premium_$chatId",
+            providerToken = AppConfig.providerToken,
+            currency = "RUB",
+            prices = prices,
+            needEmail = AppConfig.requireEmailForReceipt,
+            needPhone = AppConfig.requirePhoneForReceipt,
+            sendEmailToProvider = AppConfig.requireEmailForReceipt,
+            sendPhoneToProvider = AppConfig.requirePhoneForReceipt,
+            providerData = providerData
+        )
+    }
+
+    // ====== CALLBACK ======
 
     private fun handleCallback(cb: TgCallbackQuery) {
         val chatId = cb.message?.chat?.id ?: return
@@ -198,106 +239,48 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 api.sendMessage(chatId, HELP_TEXT)
             }
+            CB_PAY_NOW -> {
+                api.answerCallback(cb.id)
+                api.deleteMessage(chatId, msgId)
+                val ok = sendTelegramInvoice(chatId)
+                if (!ok) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
+            }
         }
     }
 
-    // роутер: принимаем весь TgMessage, чтобы видеть from/reply_to_message
+    // ====== ROUTER ======
+
     private fun route(msg: TgMessage) {
         val chatId = msg.chat.id
         val msgId = msg.message_id
         val fromId = msg.from?.id
         val lower = msg.text?.lowercase().orEmpty()
 
-        // ===== Админ-проверки/команды (опционально, оставил как были у нас) =====
         if (lower.startsWith("/whoami")) {
             api.sendMessage(chatId, "Ваш Telegram ID: ${fromId ?: "неизвестен"}")
             return
         }
 
-        if (lower.startsWith("/premiumstatus")) {
-            if (fromId !in ADMIN_IDS) { api.sendMessage(chatId, "Недостаточно прав."); return }
-            val parts = msg.text!!.trim().split(Regex("\\s+"))
-            val targetId: Long? = when {
-                msg.reply_to_message != null && parts.size == 1 -> msg.reply_to_message.from?.id
-                parts.size >= 2 -> parts[1].toLongOrNull()
-                else -> null
-            }
-            if (targetId == null) {
-                api.sendMessage(chatId, "Форматы:\n— по reply: /premiumstatus\n— напрямую: /premiumstatus <userId>")
-                return
-            }
-            val until = PremiumRepo.getUntil(targetId)
-            val now = System.currentTimeMillis()
-            if (until == null || until <= now) {
-                api.sendMessage(chatId, "Статус пользователя $targetId: премиум не активен.")
-                return
-            }
-            val remainingMs = until - now
-            val days = remainingMs / (24 * 60 * 60 * 1000)
-            val hours = (remainingMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
-            val untilStr = dtf.format(Instant.ofEpochMilli(until))
-            api.sendMessage(chatId, "Статус пользователя $targetId: активен до $untilStr (осталось: $days дн $hours ч).")
+        if (lower.startsWith("/premium")) {
+            val ok = sendTelegramInvoice(chatId)
+            if (!ok) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
             return
         }
 
-        if (lower.startsWith("/grantpremium")) {
-            if (fromId !in ADMIN_IDS) { api.sendMessage(chatId, "Недостаточно прав."); return }
-            val parts = msg.text!!.trim().split(Regex("\\s+"))
-            when {
-                msg.reply_to_message != null && parts.size == 2 -> {
-                    val days = parts[1].toIntOrNull()
-                    val target = msg.reply_to_message.from?.id
-                    if (days == null || days <= 0 || target == null) {
-                        api.sendMessage(chatId, "Формат (по reply): /grantpremium <days>")
-                        return
-                    }
-                    app.db.PremiumRepo.grantDays(target, days)
-                    val until = app.db.PremiumRepo.getUntil(target)
-                    val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
-                    api.sendMessage(chatId, "Ок. Пользователь $target получил премиум на $days дн. До: $untilStr")
-                }
-                parts.size >= 3 -> {
-                    val target = parts[1].toLongOrNull()
-                    val days = parts[2].toIntOrNull()
-                    if (target == null || days == null || days <= 0) {
-                        api.sendMessage(chatId, "Формат: /grantpremium <userId> <days>")
-                        return
-                    }
-                    app.db.PremiumRepo.grantDays(target, days)
-                    val until = app.db.PremiumRepo.getUntil(target)
-                    val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
-                    api.sendMessage(chatId, "Ок. Пользователь $target получил премиум на $days дн. До: $untilStr")
-                }
-                else -> api.sendMessage(chatId, "Форматы:\n— по reply: /grantpremium <days>\n— напрямую: /grantpremium <userId> <days>")
-            }
-            return
-        }
-
-        // ===== Ожидание данных в режимах (не считаем лимит, пока пользователь вводит данные) =====
         when (state[chatId]) {
             BotState.AWAITING_CALORIE_INPUT ->
-                if (!lower.startsWith("/")) {
-                    handleCalorieInput(chatId, msg.text ?: ""); return
-                }
+                if (!lower.startsWith("/")) { handleCalorieInput(chatId, msg.text ?: ""); return }
             BotState.AWAITING_PRODUCT_INPUT ->
-                if (!lower.startsWith("/")) {
-                    handleProductInput(chatId, msg.text ?: ""); return
-                }
+                if (!lower.startsWith("/")) { handleProductInput(chatId, msg.text ?: ""); return }
             else -> {}
         }
 
-        // ===== Обычные команды (не списывают лимит) =====
         when (lower) {
             "/start" -> {
                 api.deleteMessage(chatId, msgId)
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
-                api.sendPhotoResource(
-                    chatId = chatId,
-                    resourcePath = START_IMAGE_RES,
-                    caption = START_GREETING_RU,
-                    replyMarkup = inlineMenu()
-                )
+                api.sendPhotoResource(chatId, START_IMAGE_RES, START_GREETING_RU, inlineMenu())
                 return
             }
             "/recipes" -> { mode[chatId] = PersonaMode.CHEF; state.remove(chatId); api.sendMessage(chatId, CHEF_INPUT_PROMPT); return }
@@ -306,7 +289,6 @@ class TelegramLongPolling(
             "/help" -> { api.sendMessage(chatId, HELP_TEXT); return }
         }
 
-        // ===== Обычный текст — в зависимости от текущего режима =====
         when (mode[chatId] ?: PersonaMode.CHEF) {
             PersonaMode.CHEF    -> handleChef(chatId, msg.text ?: "")
             PersonaMode.CALC    -> handleCalorieInput(chatId, msg.text ?: "")
@@ -314,11 +296,11 @@ class TelegramLongPolling(
         }
     }
 
-    // ======= ТРИ МЕСТА, ГДЕ СПИСЫВАЕМ ЛИМИТ ПЕРЕД ВЫЗОВОМ ИИ =======
+    // ====== LLM (админы — безлимит) ======
 
     private fun handleChef(chatId: Long, userText: String) {
-        if (!RateLimiter.checkAndConsume(chatId)) {
-            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT); return
+        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) {
+            sendPaywall(chatId); return
         }
         val sys = ChatMessage("system", PersonaPrompt.system())
         val user = ChatMessage("user", userText)
@@ -327,8 +309,8 @@ class TelegramLongPolling(
     }
 
     private fun handleCalorieInput(chatId: Long, userText: String) {
-        if (!RateLimiter.checkAndConsume(chatId)) {
-            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT); state.remove(chatId); return
+        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) {
+            sendPaywall(chatId); state.remove(chatId); return
         }
         val sys = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
@@ -338,14 +320,25 @@ class TelegramLongPolling(
     }
 
     private fun handleProductInput(chatId: Long, userText: String) {
-        if (!RateLimiter.checkAndConsume(chatId)) {
-            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT); state.remove(chatId); return
+        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) {
+            sendPaywall(chatId); state.remove(chatId); return
         }
         val sys = ChatMessage("system", ProductInfoPrompt.SYSTEM)
         val user = ChatMessage("user", "Ингредиент: $userText")
         val reply = llm.complete(listOf(sys, user))
         api.sendMessage(chatId, reply)
         state.remove(chatId)
+    }
+
+    // ====== Paywall: одна кнопка оплаты в Telegram ======
+
+    private fun sendPaywall(chatId: Long) {
+        val kb = InlineKeyboardMarkup(
+            inline_keyboard = listOf(
+                listOf(InlineKeyboardButton("Оплатить в Telegram", CB_PAY_NOW))
+            )
+        )
+        api.sendMessage(chatId, AppConfig.PAYWALL_TEXT, replyMarkup = kb)
     }
 
     private fun inlineMenu(): InlineKeyboardMarkup =

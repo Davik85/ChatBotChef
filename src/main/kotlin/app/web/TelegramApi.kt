@@ -1,168 +1,121 @@
 package app.web
 
 import app.AppConfig
-import app.common.Json
 import app.web.dto.*
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
 import java.time.Duration
 
-private const val TG_LIMIT = 4096
-private const val TG_SAFE_CHUNK = 3500
-
 class TelegramApi(private val token: String) {
-    private val mapper = Json.mapper
-    private val json = "application/json; charset=utf-8".toMediaType()
-
+    private val mapper = jacksonObjectMapper()
     private val client = OkHttpClient.Builder()
         .callTimeout(Duration.ofSeconds(30))
         .connectTimeout(Duration.ofSeconds(10))
         .readTimeout(Duration.ofSeconds(30))
         .build()
 
+    private fun url(method: String) = "${AppConfig.TELEGRAM_BASE}/bot$token/$method"
+    private val json = "application/json; charset=utf-8".toMediaType()
+
     fun getMe(): Boolean {
-        val url = "${AppConfig.TELEGRAM_BASE}/bot$token/getMe"
-        val req = Request.Builder().url(url).get().build()
-        client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("getMe HTTP ${resp.code}: $body"); return false }
-            val parsed: TgApiResp<TgApiUserMe> = mapper.readValue(body)
+        val req = Request.Builder().url(url("getMe")).get().build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<Map<String, Any?>> = mapper.readValue(raw)
             return parsed.ok
         }
     }
 
     fun getUpdates(offset: Long?): List<TgUpdate> {
-        val base = "${AppConfig.TELEGRAM_BASE}/bot$token/getUpdates"
-        val allowed = URLEncoder.encode(
-            """["message","edited_message","callback_query","pre_checkout_query"]""",
-            StandardCharsets.UTF_8
+        val args = mutableMapOf<String, Any>(
+            "timeout" to 25,
+            "allowed_updates" to listOf("message", "edited_message", "callback_query", "pre_checkout_query")
         )
-        val url = buildString {
-            append("$base?timeout=25&allowed_updates=$allowed")
-            if (offset != null) append("&offset=$offset")
-        }
-        val req = Request.Builder().url(url).get().build()
-        client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("getUpdates HTTP ${resp.code}: $body"); return emptyList() }
-            val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(body)
-            if (!parsed.ok) { println("getUpdates API ${parsed.error_code}: ${parsed.description}"); return emptyList() }
+        if (offset != null) args["offset"] = offset
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("getUpdates")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(raw)
             return parsed.result ?: emptyList()
         }
     }
 
-    fun sendMessage(chatId: Long, text: String, parseMode: String? = null, replyMarkup: ReplyMarkup? = null): Boolean {
-        var ok = true
-        for (chunk in chunks(text)) {
-            val payload = mapper.writeValueAsString(
-                TgSendMessage(chat_id = chatId, text = chunk, parse_mode = parseMode, reply_markup = replyMarkup)
-            )
-            val req = Request.Builder()
-                .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendMessage")
-                .post(payload.toRequestBody(json))
-                .build()
-            client.newCall(req).execute().use { resp ->
-                val b = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) { ok = false; println("sendMessage HTTP ${resp.code}: $b") }
-            }
+    fun sendMessage(chatId: Long, text: String, replyMarkup: InlineKeyboardMarkup? = null): Int? {
+        val args = mutableMapOf<String, Any>("chat_id" to chatId, "text" to text, "parse_mode" to "Markdown")
+        if (replyMarkup != null) args["reply_markup"] = replyMarkup
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("sendMessage")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+            return parsed.result?.message_id
         }
-        return ok
-    }
-
-    // ---- Фото из ресурсов (для стартового баннера) ----
-    fun sendPhotoFile(chatId: Long, filePath: String, caption: String? = null, replyMarkup: ReplyMarkup? = null): Boolean {
-        val file = File(filePath)
-        if (!file.exists() || !file.isFile) {
-            println("sendPhotoFile ERR: file not found: $filePath"); return false
-        }
-        val media = "application/octet-stream".toMediaType()
-        val fileBody: RequestBody = file.asRequestBody(media)
-
-        val builder = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("chat_id", chatId.toString())
-            .addFormDataPart("photo", file.name, fileBody)
-
-        if (!caption.isNullOrBlank()) builder.addFormDataPart("caption", caption)
-        if (replyMarkup != null) builder.addFormDataPart("reply_markup", mapper.writeValueAsString(replyMarkup))
-
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendPhoto")
-            .post(builder.build())
-            .build()
-
-        client.newCall(req).execute().use { resp ->
-            val b = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("sendPhotoFile HTTP ${resp.code}: $b"); return false }
-        }
-        return true
-    }
-
-    fun sendPhotoResource(chatId: Long, resourcePath: String, caption: String? = null, replyMarkup: ReplyMarkup? = null): Boolean {
-        val loader = Thread.currentThread().contextClassLoader
-        val url = loader.getResource(resourcePath)
-        return if (url != null) {
-            val tmp = File.createTempFile("tg_photo_", "_" + File(resourcePath).name)
-            tmp.outputStream().use { out -> url.openStream().use { it.copyTo(out) } }
-            tmp.deleteOnExit()
-            sendPhotoFile(chatId, tmp.absolutePath, caption, replyMarkup)
-        } else {
-            sendPhotoFile(chatId, resourcePath, caption, replyMarkup)
-        }
-    }
-
-    fun answerCallback(callbackId: String, text: String? = null) {
-        // ✅ без buildMap — максимально совместимо
-        val body = mutableMapOf<String, Any?>(
-            "callback_query_id" to callbackId
-        )
-        if (!text.isNullOrBlank()) body["text"] = text
-
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/answerCallbackQuery")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { }
     }
 
     fun deleteMessage(chatId: Long, messageId: Int): Boolean {
-        val body = mapOf("chat_id" to chatId, "message_id" to messageId)
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/deleteMessage")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            val raw = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("deleteMessage HTTP ${resp.code}: $raw"); return false }
-            val okNode = try { mapper.readTree(raw).get("ok")?.asBoolean() } catch (_: Throwable) { null }
-            return okNode ?: true
+        val args = mapOf("chat_id" to chatId, "message_id" to messageId)
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("deleteMessage")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<Boolean> = mapper.readValue(raw)
+            return parsed.ok && (parsed.result == true)
         }
     }
 
-    fun deleteInlineKeyboard(chatId: Long, messageId: Int) {
-        val body = mapOf(
-            "chat_id" to chatId,
-            "message_id" to messageId,
-            "reply_markup" to mapOf("inline_keyboard" to emptyList<List<Any>>())
-        )
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/editMessageReplyMarkup")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { }
+    fun deleteInlineKeyboard(chatId: Long, messageId: Int): Boolean {
+        val args = mapOf("chat_id" to chatId, "message_id" to messageId, "reply_markup" to InlineKeyboardMarkup(emptyList()))
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("editMessageReplyMarkup")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<Map<String, Any?>> = mapper.readValue(raw)
+            return parsed.ok
+        }
     }
 
-    // ====================== PAYMENTS ======================
+    fun sendPhotoResource(chatId: Long, resourcePath: String, caption: String? = null, replyMarkup: InlineKeyboardMarkup? = null): Int? {
+        val stream = Thread.currentThread().contextClassLoader.getResourceAsStream(resourcePath)
+            ?: return sendMessage(chatId, caption ?: "")
+        val tmp = File.createTempFile("tg-photo-", ".jpg").apply { deleteOnExit() }
+        tmp.outputStream().use { out -> stream.copyTo(out) }
 
-    /** Выставить счёт пользователю. Prices — список позиций в копейках. */
+        val part = tmp.asRequestBody("image/jpeg".toMediaType())
+        val form = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("chat_id", chatId.toString())
+            .addFormDataPart("photo", tmp.name, part)
+        if (!caption.isNullOrBlank()) form.addFormDataPart("caption", caption)
+        if (replyMarkup != null) form.addFormDataPart("reply_markup", mapper.writeValueAsString(replyMarkup))
+
+        val req = Request.Builder().url(url("sendPhoto")).post(form.build()).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+            return parsed.result?.message_id
+        }
+    }
+
+    fun answerCallback(callbackId: String): Boolean {
+        val args = mapOf("callback_query_id" to callbackId)
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("answerCallbackQuery")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<Boolean> = mapper.readValue(raw)
+            return parsed.ok && (parsed.result == true)
+        }
+    }
+
+    // ===== Payments (с 54-ФЗ) =====
+
     fun sendInvoice(
         chatId: Long,
         title: String,
@@ -170,10 +123,14 @@ class TelegramApi(private val token: String) {
         payload: String,
         providerToken: String,
         currency: String,
-        prices: List<LabeledPrice>,
-        photoUrl: String? = null
+        prices: List<TgLabeledPrice>,
+        needEmail: Boolean = false,
+        needPhone: Boolean = false,
+        sendEmailToProvider: Boolean = false,
+        sendPhoneToProvider: Boolean = false,
+        providerData: Map<String, Any>? = null, // <<< ЧЕК 54-ФЗ
     ): Boolean {
-        val body = mutableMapOf<String, Any?>(
+        val args = mutableMapOf<String, Any>(
             "chat_id" to chatId,
             "title" to title,
             "description" to description,
@@ -182,55 +139,30 @@ class TelegramApi(private val token: String) {
             "currency" to currency,
             "prices" to prices
         )
-        if (!photoUrl.isNullOrBlank()) body["photo_url"] = photoUrl
+        if (needEmail) args["need_email"] = true
+        if (needPhone) args["need_phone_number"] = true
+        if (sendEmailToProvider) args["send_email_to_provider"] = true
+        if (sendPhoneToProvider) args["send_phone_number_to_provider"] = true
+        if (providerData != null) args["provider_data"] = providerData
 
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/sendInvoice")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            val b = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("sendInvoice HTTP ${resp.code}: $b"); return false }
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("sendInvoice")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+            return parsed.ok && parsed.result != null
         }
-        return true
     }
 
-    /** Ответ на pre_checkout_query: необходимо вернуть ok=true, иначе Telegram не завершит платёж. */
-    fun answerPreCheckoutQuery(id: String, ok: Boolean, error: String? = null): Boolean {
-        // ✅ без buildMap — максимально совместимо
-        val body = mutableMapOf<String, Any?>(
-            "pre_checkout_query_id" to id,
-            "ok" to ok
-        )
-        if (!ok && !error.isNullOrBlank()) body["error_message"] = error
-
-        val req = Request.Builder()
-            .url("${AppConfig.TELEGRAM_BASE}/bot$token/answerPreCheckoutQuery")
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
-        client.newCall(req).execute().use { resp ->
-            val b = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) { println("answerPreCheckoutQuery HTTP ${resp.code}: $b"); return false }
+    fun answerPreCheckoutQuery(id: String, ok: Boolean, errorMessage: String? = null): Boolean {
+        val args = mutableMapOf<String, Any>("pre_checkout_query_id" to id, "ok" to ok)
+        if (!ok && !errorMessage.isNullOrBlank()) args["error_message"] = errorMessage
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("answerPreCheckoutQuery")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            val parsed: TgApiResp<Boolean> = mapper.readValue(raw)
+            return parsed.ok && (parsed.result == true)
         }
-        return true
-    }
-
-    // ---------- helpers ----------
-    private fun chunks(s: String): List<String> {
-        if (s.length <= TG_LIMIT) return listOf(s)
-        val parts = mutableListOf<String>()
-        val seps = listOf("\n---\n", "\n\n", "\n")
-        var rest = s
-        while (rest.length > TG_SAFE_CHUNK) {
-            var cut = TG_SAFE_CHUNK
-            for (sep in seps) {
-                val idx = rest.lastIndexOf(sep, TG_SAFE_CHUNK)
-                if (idx >= 0 && idx >= TG_SAFE_CHUNK - 400) { cut = idx + sep.length; break }
-            }
-            parts += rest.substring(0, cut)
-            rest = rest.substring(cut)
-        }
-        if (rest.isNotEmpty()) parts += rest
-        return parts
     }
 }
