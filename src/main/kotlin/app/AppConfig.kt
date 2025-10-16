@@ -56,13 +56,27 @@ object AppConfig {
     val paymentsEnabled: Boolean
         get() = !providerToken.isNullOrBlank()
 
+    private fun readBoolean(key: String, default: Boolean): Boolean {
+        val raw = clean(readRaw(key)) ?: return default
+        return when (raw.lowercase()) {
+            "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> error("$key must be boolean-like (true/false)")
+        }
+    }
+
     // Цена и срок подписки
     val premiumPriceRub: Int by lazy { (clean(readRaw("PREMIUM_PRICE_RUB")) ?: "700").toInt() }
     val premiumDays: Int by lazy { (clean(readRaw("PREMIUM_DAYS")) ?: "30").toInt() }
 
     // Параметры для чека (54-ФЗ)
-    val taxSystemCode: Int by lazy { (clean(readRaw("TAX_SYSTEM_CODE")) ?: "2").toInt() }     // 1-6
-    val vatCode: Int by lazy { (clean(readRaw("VAT_CODE")) ?: "6").toInt() }                  // 1..6 (6=НДС не облагается)
+    val receiptsEnabled: Boolean by lazy { readBoolean("RECEIPTS_ENABLED", default = true) }
+    val taxSystemCode: Int? by lazy {
+        if (!receiptsEnabled) null else (clean(readRaw("TAX_SYSTEM_CODE")) ?: "2").toInt()
+    }     // 1-6
+    val vatCode: Int? by lazy {
+        if (!receiptsEnabled) null else (clean(readRaw("VAT_CODE")) ?: "6").toInt()
+    }                  // 1..6 (6=НДС не облагается)
     val paymentSubject: String by lazy { clean(readRaw("PAYMENT_SUBJECT")) ?: "service" }    // service / commodity / ...
     val paymentMode: String by lazy { clean(readRaw("PAYMENT_MODE")) ?: "full_prepayment" }  // full_prepayment / ...
     val requirePhoneForReceipt: Boolean by lazy { (clean(readRaw("REQUIRE_PHONE_FOR_RECEIPT")) ?: "false").toBoolean() }
