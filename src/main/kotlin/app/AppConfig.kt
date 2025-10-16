@@ -1,6 +1,7 @@
 package app
 
 import io.github.cdimascio.dotenv.dotenv
+import java.util.Locale
 
 object AppConfig {
     private val env = dotenv { ignoreIfMissing = true }
@@ -56,17 +57,56 @@ object AppConfig {
     val paymentsEnabled: Boolean
         get() = !providerToken.isNullOrBlank()
 
+    private fun parseBoolean(key: String, raw: String): Boolean = when (raw.lowercase(Locale.ROOT)) {
+        "true", "1", "yes", "on" -> true
+        "false", "0", "no", "off" -> false
+        else -> error("$key must be boolean-like (true/false)")
+    }
+
+    private fun readOptionalBoolean(key: String): Boolean? {
+        val raw = clean(readRaw(key)) ?: return null
+        return parseBoolean(key, raw)
+    }
+
     // Цена и срок подписки
     val premiumPriceRub: Int by lazy { (clean(readRaw("PREMIUM_PRICE_RUB")) ?: "700").toInt() }
     val premiumDays: Int by lazy { (clean(readRaw("PREMIUM_DAYS")) ?: "30").toInt() }
 
     // Параметры для чека (54-ФЗ)
-    val taxSystemCode: Int by lazy { (clean(readRaw("TAX_SYSTEM_CODE")) ?: "2").toInt() }     // 1-6
-    val vatCode: Int by lazy { (clean(readRaw("VAT_CODE")) ?: "6").toInt() }                  // 1..6 (6=НДС не облагается)
+    val isNpdMerchant: Boolean by lazy { readOptionalBoolean("NPD_MODE") ?: false }
+    val receiptsEnabled: Boolean by lazy {
+        if (isNpdMerchant) {
+            false
+        } else {
+            readOptionalBoolean("RECEIPTS_ENABLED") ?: true
+        }
+    }
+
+    private fun readOptionalInt(key: String): Int? {
+        val raw = clean(readRaw(key)) ?: return null
+        return raw.toIntOrNull() ?: error("$key must be a number")
+    }
+
+    val taxSystemCode: Int? by lazy {
+        if (!receiptsEnabled) return@lazy null
+        val value = readOptionalInt("TAX_SYSTEM_CODE") ?: 2
+        require(value in 1..6) { "TAX_SYSTEM_CODE must be between 1 and 6" }
+        value
+    }     // 1-6
+    val vatCode: Int? by lazy {
+        if (!receiptsEnabled) return@lazy null
+        val value = readOptionalInt("VAT_CODE") ?: 6
+        require(value in 1..6) { "VAT_CODE must be between 1 and 6" }
+        value
+    }                  // 1..6 (6=НДС не облагается)
     val paymentSubject: String by lazy { clean(readRaw("PAYMENT_SUBJECT")) ?: "service" }    // service / commodity / ...
     val paymentMode: String by lazy { clean(readRaw("PAYMENT_MODE")) ?: "full_prepayment" }  // full_prepayment / ...
-    val requirePhoneForReceipt: Boolean by lazy { (clean(readRaw("REQUIRE_PHONE_FOR_RECEIPT")) ?: "false").toBoolean() }
-    val requireEmailForReceipt: Boolean by lazy { (clean(readRaw("REQUIRE_EMAIL_FOR_RECEIPT")) ?: "true").toBoolean() }
+    val requirePhoneForReceipt: Boolean by lazy {
+        if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_PHONE_FOR_RECEIPT") ?: false
+    }
+    val requireEmailForReceipt: Boolean by lazy {
+        if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_EMAIL_FOR_RECEIPT") ?: true
+    }
 
     // Paywall (используется в paywall-сообщениях)
     val PAYWALL_TEXT: String
