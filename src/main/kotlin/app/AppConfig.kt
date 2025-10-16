@@ -51,8 +51,10 @@ object AppConfig {
     val DB_PATH: String by lazy { clean(readRaw("DB_PATH")) ?: "data/chatbotchef.sqlite" }
 
     // --- платежи в Telegram ---
-    // Тестовый/боевой provider token из @BotFather → Payments
-    val providerToken: String by lazy { requireNotNull(clean(readRaw("PROVIDER_TOKEN"))) { "PROVIDER_TOKEN is required" } }
+    // Тестовый/боевой provider token из @BotFather → Payments (может отсутствовать на окружениях без оплаты)
+    val providerToken: String? by lazy { clean(readRaw("PROVIDER_TOKEN")) }
+    val paymentsEnabled: Boolean
+        get() = !providerToken.isNullOrBlank()
 
     // Цена и срок подписки
     val premiumPriceRub: Int by lazy { (clean(readRaw("PREMIUM_PRICE_RUB")) ?: "700").toInt() }
