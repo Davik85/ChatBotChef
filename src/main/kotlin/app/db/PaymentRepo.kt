@@ -39,7 +39,7 @@ object PaymentRepo {
             it[Payments.telegram_charge_id] = null
             it[Payments.provider_charge_id] = null
         }
-        if (inserted == 0) {
+        if (inserted.insertedCount == 0) {
             Payments.update({ Payments.payload eq payload }) {
                 it[Payments.user_id] = userId
                 it[Payments.amount_minor] = amountMinor
