@@ -65,6 +65,13 @@ object AppConfig {
     private fun readOptionalBoolean(key: String): Boolean? {
         val raw = clean(readRaw(key)) ?: return null
         return parseBoolean(key, raw)
+    private fun readBoolean(key: String, default: Boolean): Boolean {
+        val raw = clean(readRaw(key)) ?: return default
+        return when (raw.lowercase()) {
+            "true", "1", "yes", "on" -> true
+            "false", "0", "no", "off" -> false
+            else -> error("$key must be boolean-like (true/false)")
+        }
     }
 
     // Цена и срок подписки
@@ -80,6 +87,7 @@ object AppConfig {
             readOptionalBoolean("RECEIPTS_ENABLED") ?: true
         }
     }
+    val receiptsEnabled: Boolean by lazy { readBoolean("RECEIPTS_ENABLED", default = true) }
     val taxSystemCode: Int? by lazy {
         if (!receiptsEnabled) null else (clean(readRaw("TAX_SYSTEM_CODE")) ?: "2").toInt()
     }     // 1-6
