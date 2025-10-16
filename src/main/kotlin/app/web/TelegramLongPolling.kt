@@ -6,6 +6,8 @@ import app.llm.dto.ChatMessage
 import app.logic.PersonaPrompt
 import app.logic.CalorieCalculatorPrompt
 import app.logic.ProductInfoPrompt
+import app.pay.PaymentService
+import app.pay.ReceiptBuilder
 import app.web.dto.InlineKeyboardButton
 import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
@@ -17,7 +19,6 @@ import app.logic.RateLimiter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.util.Locale
 
 class TelegramLongPolling(
     private val token: String,
@@ -162,11 +163,22 @@ class TelegramLongPolling(
     // ===== Payments =====
 
     private fun handlePreCheckout(q: TgPreCheckoutQuery) {
+        val validation = PaymentService.validatePreCheckout(q)
+        if (!validation.ok) {
+            api.answerPreCheckoutQuery(q.id, ok = false, errorMessage = validation.errorMessage)
+            return
+        }
         api.answerPreCheckoutQuery(q.id, ok = true)
     }
 
     private fun handleSuccessfulPayment(msg: TgMessage) {
         val chatId = msg.chat.id
+        val payment = msg.successful_payment ?: return
+        val recorded = PaymentService.handleSuccessfulPayment(chatId, payment)
+        if (!recorded) {
+            api.sendMessage(chatId, "Мы получили уведомление об оплате, но не смогли подтвердить её автоматически. Поддержка уже уведомлена.")
+            return
+        }
         PremiumRepo.grantDays(chatId, AppConfig.premiumDays)
         val until = PremiumRepo.getUntil(chatId)
         val untilStr = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
@@ -174,32 +186,27 @@ class TelegramLongPolling(
     }
 
     private fun sendTelegramInvoice(chatId: Long): Boolean {
+        if (!PaymentService.paymentsAvailable) {
+            api.sendMessage(chatId, PaymentService.paymentsDisabledMessage)
+            return false
+        }
+        val providerToken = AppConfig.providerToken
+        if (providerToken.isNullOrBlank()) {
+            api.sendMessage(chatId, PaymentService.paymentsDisabledMessage)
+            return false
+        }
         val title = "Премиум-доступ на ${AppConfig.premiumDays} дней"
         val desc = "Доступ ко всем функциям бота без ограничений."
         val prices = listOf(TgLabeledPrice(label = "Подписка", amount = AppConfig.premiumPriceRub * 100))
-
-        val value = String.format(Locale.US, "%.2f", AppConfig.premiumPriceRub.toDouble())
-        val item = mapOf(
-            "description" to title.take(128),
-            "quantity" to "1.00",
-            "amount" to mapOf("value" to value, "currency" to "RUB"),
-            "vat_code" to AppConfig.vatCode,
-            "payment_mode" to AppConfig.paymentMode,
-            "payment_subject" to AppConfig.paymentSubject
-        )
-        val providerData = mapOf(
-            "receipt" to mapOf(
-                "items" to listOf(item),
-                "tax_system_code" to AppConfig.taxSystemCode
-            )
-        )
-
-        return api.sendInvoice(
+        val payload = PaymentService.newInvoicePayload(chatId)
+        PaymentService.registerInvoice(payload, chatId)
+        val providerData = ReceiptBuilder.providerDataForSubscription(AppConfig.premiumPriceRub, title)
+        val sent = api.sendInvoice(
             chatId = chatId,
             title = title,
             description = desc,
-            payload = "premium_$chatId",
-            providerToken = AppConfig.providerToken,
+            payload = payload,
+            providerToken = providerToken,
             currency = "RUB",
             prices = prices,
             needEmail = AppConfig.requireEmailForReceipt,
@@ -208,6 +215,10 @@ class TelegramLongPolling(
             sendPhoneToProvider = AppConfig.requirePhoneForReceipt,
             providerData = providerData
         )
+        if (!sent) {
+            PaymentService.markInvoiceFailure(payload, "send_invoice_failed")
+        }
+        return sent
     }
 
     // ===== Callback =====
@@ -251,7 +262,7 @@ class TelegramLongPolling(
                 api.answerCallback(cb.id)
                 api.deleteMessage(chatId, msgId)
                 val ok = sendTelegramInvoice(chatId)
-                if (!ok) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
+                if (!ok && PaymentService.paymentsAvailable) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
             }
         }
     }
@@ -295,7 +306,7 @@ class TelegramLongPolling(
         }
         if (lower.startsWith("/premium")) {
             val ok = sendTelegramInvoice(chatId)
-            if (!ok) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
+            if (!ok && PaymentService.paymentsAvailable) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
             return
         }
 
@@ -357,6 +368,10 @@ class TelegramLongPolling(
     }
 
     private fun sendPaywall(chatId: Long) {
+        if (!PaymentService.paymentsAvailable) {
+            api.sendMessage(chatId, PaymentService.paymentsDisabledMessage)
+            return
+        }
         val kb = InlineKeyboardMarkup(
             inline_keyboard = listOf(
                 listOf(InlineKeyboardButton("Оплатить в Telegram", CB_PAY_NOW))
@@ -410,6 +425,10 @@ class TelegramLongPolling(
     }
 
     private fun sendReminder(userId: Long, text: String) {
+        if (!PaymentService.paymentsAvailable) {
+            api.sendMessage(userId, PaymentService.paymentsDisabledMessage)
+            return
+        }
         val kb = InlineKeyboardMarkup(
             inline_keyboard = listOf(
                 listOf(InlineKeyboardButton("Оплатить в Telegram", CB_PAY_NOW))

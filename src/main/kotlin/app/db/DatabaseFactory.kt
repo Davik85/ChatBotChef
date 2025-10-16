@@ -58,6 +58,21 @@ object PremiumReminders : Table(name = "premium_reminders") {
     override val primaryKey = PrimaryKey(id)
 }
 
+/** История платежей для предотвращения дублей и расследования инцидентов */
+object Payments : Table(name = "payments") {
+    val payload = varchar("payload", length = 128)
+    val user_id = long("user_id").index()
+    val amount_minor = integer("amount_minor")
+    val currency = varchar("currency", length = 8)
+    val status = varchar("status", length = 32)
+    val failure_reason = text("failure_reason").nullable()
+    val telegram_charge_id = varchar("telegram_charge_id", length = 128).nullable()
+    val provider_charge_id = varchar("provider_charge_id", length = 128).nullable()
+    val created_at = long("created_at")
+    val updated_at = long("updated_at")
+    override val primaryKey = PrimaryKey(payload)
+}
+
 object DatabaseFactory {
 
     fun init() {
@@ -296,13 +311,24 @@ object DatabaseFactory {
             if (tableExists("processed_updates")) {
                 addColumnIfMissing("processed_updates", "update_id INTEGER NOT NULL DEFAULT 0")
             }
+            if (tableExists("payments")) {
+                addColumnIfMissing("payments", "status TEXT NOT NULL DEFAULT 'invoice'")
+                addColumnIfMissing("payments", "failure_reason TEXT NULL")
+                addColumnIfMissing("payments", "telegram_charge_id TEXT NULL")
+                addColumnIfMissing("payments", "provider_charge_id TEXT NULL")
+                addColumnIfMissing("payments", "amount_minor INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("payments", "currency TEXT NOT NULL DEFAULT 'RUB'")
+                addColumnIfMissing("payments", "created_at INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("payments", "updated_at INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("payments", "user_id INTEGER NOT NULL DEFAULT 0")
+            }
         }
 
         // 5) добиваем недостающие объекты штатно
         transaction {
             SchemaUtils.createMissingTablesAndColumns(
                 Users, Messages, MemoryNotesV2, UserStats, ProcessedUpdates,
-                PremiumUsers, PremiumReminders
+                PremiumUsers, PremiumReminders, Payments
             )
         }
     }
