@@ -8,20 +8,23 @@ object ReceiptBuilder {
      * Возвращает provider_data для Telegram Payments (ЮKassa).
      * Телеграм сам добавит в receipt.customer phone/email, если мы попросим их флагами в sendInvoice.
      */
-    fun providerDataForSubscription(amountRub: Int, title: String): Map<String, Any> {
+    fun providerDataForSubscription(amountRub: Int, title: String): Map<String, Any>? {
+        if (!AppConfig.receiptsEnabled) {
+            return null
+        }
         val value = String.format(Locale.US, "%.2f", amountRub.toDouble())
-        val item = mapOf(
+        val item = mutableMapOf<String, Any>(
             "description" to title.take(128),
             "quantity" to "1.00",
             "amount" to mapOf("value" to value, "currency" to "RUB"),
-            "vat_code" to AppConfig.vatCode,
             "payment_mode" to AppConfig.paymentMode,
             "payment_subject" to AppConfig.paymentSubject
         )
+        AppConfig.vatCode?.let { item["vat_code"] = it }
         val receipt = mutableMapOf<String, Any>(
-            "items" to listOf(item),
-            "tax_system_code" to AppConfig.taxSystemCode
+            "items" to listOf(item)
         )
+        AppConfig.taxSystemCode?.let { receipt["tax_system_code"] = it }
         // customer.* не указываем — Телеграм подставит phone/email при need_* флагах
         return mapOf("receipt" to receipt)
     }
