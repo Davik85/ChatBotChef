@@ -1,3 +1,10 @@
+import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.bundling.Jar
+import org.gradle.kotlin.dsl.getByName
+import org.gradle.kotlin.dsl.registering
+import org.gradle.kotlin.dsl.the
+
 plugins {
     kotlin("jvm") version "2.0.21"
     application
@@ -32,4 +39,36 @@ kotlin {
 
 application {
     mainClass.set("app.MainKt")
+}
+
+tasks.jar {
+    // Обычный jar будет «тонким». Выполнять можно через shadowJar (толстый).
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+}
+
+tasks.withType<Jar>().configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+val mainSourceSet = the<SourceSetContainer>().getByName("main")
+
+val shadowJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("all")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+
+    from(mainSourceSet.output)
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.exists() && it.extension == "jar" }
+            .map { zipTree(it) }
+    })
+}
+
+tasks.named("assemble") {
+    dependsOn(shadowJar)
 }
