@@ -5,9 +5,10 @@ build/
 !**/src/test/**/build/
 /.gradle/
 bot.db
-.env
+build/libs/.env
 ChatBotChef.bundle
 ChatBotChef.iml
+.env
 
 ### IntelliJ IDEA ###
 .idea/*

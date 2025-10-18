@@ -31,53 +31,75 @@ class OpenAIClient(
         .callTimeout(Duration.ofSeconds(90))
         .build()
 
-    fun healthCheck(): Boolean {
-        val req = Request.Builder()
-            .url("https://api.openai.com/v1/models")
-            .addHeader("Authorization", "Bearer $apiKey")
-            .apply {
-                AppConfig.openAiOrg?.let { addHeader("OpenAI-Organization", it) }
-                AppConfig.openAiProject?.let { addHeader("OpenAI-Project", it) }
-            }
-            .get()
-            .build()
-        return http.newCall(req).execute().use { resp -> resp.isSuccessful }
+    /** Общие заголовки с учётом project/org. */
+    private fun headers(): okhttp3.Headers {
+        val b = okhttp3.Headers.Builder()
+            .add("Authorization", "Bearer $apiKey")
+            .add("Content-Type", "application/json")
+        AppConfig.openAiOrg?.takeIf { it.isNotBlank() }?.let { b.add("OpenAI-Organization", it) }
+        AppConfig.openAiProject?.takeIf { it.isNotBlank() }?.let { b.add("OpenAI-Project", it) }
+        return b.build()
     }
 
+    /**
+     * Простой GET /v1/models. Если 200 — считаем доступ валидным для текущего ключа/проекта.
+     * Любые исключения — лог и false (без падения процесса).
+     */
+    fun healthCheck(): Boolean {
+        return runCatching {
+            val req = Request.Builder()
+                .url("https://api.openai.com/v1/models")
+                .headers(headers())
+                .get()
+                .build()
+            http.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    println("OPENAI-HEALTH: HTTP ${resp.code} ${resp.message} body=$body")
+                    return false
+                }
+                true
+            }
+        }.onFailure { e ->
+            println("OPENAI-HEALTH-ERR: ${e.message}")
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Chat Completions (/v1/chat/completions) c model=gpt-4.1.
+     * Отправляем max_tokens. temperature — только если поддерживается.
+     */
     fun complete(messages: List<ChatMessage>): String {
-        // For /v1/chat/completions the correct field is "max_tokens"
-        val body: MutableMap<String, Any> = mutableMapOf(
-            "model" to model,
-            "messages" to messages,
-            "max_tokens" to maxCompletionTokens
-        )
-        // temperature — только если уместно для модели
-        if (supportsTemperature(model) && temperature != null) {
-            body["temperature"] = temperature
-        }
-
-        val req = Request.Builder()
-            .url(AppConfig.OPENAI_URL)
-            .addHeader("Authorization", "Bearer $apiKey")
-            .addHeader("Content-Type", "application/json")
-            .apply {
-                AppConfig.openAiOrg?.let { addHeader("OpenAI-Organization", it) }
-                AppConfig.openAiProject?.let { addHeader("OpenAI-Project", it) }
+        return runCatching {
+            val body: MutableMap<String, Any> = mutableMapOf(
+                "model" to model,
+                "messages" to messages,           // ChatMessage должен иметь поля role/content
+                "max_tokens" to maxCompletionTokens
+            )
+            if (supportsTemperature(model) && temperature != null) {
+                body["temperature"] = temperature
             }
-            .post(mapper.writeValueAsString(body).toRequestBody(json))
-            .build()
 
-        http.newCall(req).execute().use { resp ->
-            val raw = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                println("OPENAI-HTTP-ERR: code=${resp.code} msg=${resp.message} body=$raw")
-                return AppConfig.FALLBACK_REPLY
+            val req = Request.Builder()
+                .url(AppConfig.OPENAI_URL)        // https://api.openai.com/v1/chat/completions
+                .headers(headers())
+                .post(mapper.writeValueAsString(body).toRequestBody(json))
+                .build()
+
+            http.newCall(req).execute().use { resp ->
+                val raw = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    println("OPENAI-HTTP-ERR: code=${resp.code} msg=${resp.message} body=$raw")
+                    return AppConfig.FALLBACK_REPLY
+                }
+                val parsed: ChatResponse = mapper.readValue(raw)
+                parsed.choices.firstOrNull()?.message?.content?.trim()
+                    .takeUnless { it.isNullOrBlank() }
+                    ?: AppConfig.FALLBACK_REPLY
             }
-            val parsed: ChatResponse = mapper.readValue(raw)
-            return parsed.choices.firstOrNull()?.message?.content?.trim()
-                .takeUnless { it.isNullOrBlank() }
-                ?: AppConfig.FALLBACK_REPLY
-        }
+        }.onFailure { e ->
+            println("OPENAI-COMPLETE-ERR: ${e.message}")
+        }.getOrDefault(AppConfig.FALLBACK_REPLY)
     }
 
     private fun supportsTemperature(model: String): Boolean {
