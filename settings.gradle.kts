@@ -1,12 +1,18 @@
 pluginManagement {
     repositories {
-        gradlePluginPortal()
+        gradlePluginPortal()      // <-- обязательно для com.github.johnrengelman.shadow
         mavenCentral()
     }
 }
 
-plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0"
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_PROJECT)
+    repositories {
+        mavenCentral()
+    }
 }
 
 rootProject.name = "ChatBotChef"
+// если проект одномодульный — НИЧЕГО больше не включаем.
+// если у тебя есть модуль app/, оставь строку ниже:
+// include(":app")
