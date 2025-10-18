@@ -1,8 +1,10 @@
 import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.api.plugins.JavaBasePlugin
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.bundling.Jar
 import org.gradle.kotlin.dsl.getByName
-import org.gradle.kotlin.dsl.registering
+import org.gradle.kotlin.dsl.named
+import org.gradle.kotlin.dsl.register
 import org.gradle.kotlin.dsl.the
 
 plugins {
@@ -48,17 +50,24 @@ tasks.withType<Jar>().configureEach {
 
 val mainSourceSet = the<SourceSetContainer>().getByName("main")
 
-val shadowJar by tasks.registering(Jar::class) {
+val shadowJar = tasks.register<Jar>("shadowJar") {
     archiveClassifier.set("all")
+    group = JavaBasePlugin.BUILD_GROUP
+    description = "Assembles an executable fat JAR that bundles all runtime dependencies."
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
     manifest {
         attributes["Main-Class"] = "app.MainKt"
     }
 
     from(mainSourceSet.output)
+    val runtimeClasspath = configurations.named("runtimeClasspath")
     from({
-        configurations.runtimeClasspath.get()
-            .filter { it.exists() && it.extension == "jar" }
+        runtimeClasspath.get().filter { it.isDirectory }
+    })
+    from({
+        runtimeClasspath.get()
+            .filter { it.isFile && it.extension == "jar" }
             .map { zipTree(it) }
     })
 }
