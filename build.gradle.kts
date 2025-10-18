@@ -9,11 +9,10 @@ import org.gradle.kotlin.dsl.the
 plugins {
     kotlin("jvm") version "2.0.21"
     application
+    id("com.github.johnrengelman.shadow") version "8.3.0" // сам плагин — без импортов его классов
 }
 
-repositories {
-    mavenCentral()
-}
+repositories { mavenCentral() }
 
 dependencies {
     // DB
@@ -22,20 +21,15 @@ dependencies {
     implementation("org.jetbrains.exposed:exposed-jdbc:0.53.0")
     implementation("org.xerial:sqlite-jdbc:3.45.3.0")
 
-
     // HTTP + JSON + .env
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.2")
     implementation("io.github.cdimascio:dotenv-kotlin:6.4.1")
 
-    // Логи (чтобы не было NOP)
+    // Логи
     implementation("org.slf4j:slf4j-simple:2.0.13")
 
     testImplementation(kotlin("test"))
-}
-
-kotlin {
-    jvmToolchain(21)
 }
 
 application {
