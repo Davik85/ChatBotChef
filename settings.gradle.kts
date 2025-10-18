@@ -1,4 +1,15 @@
-plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0"
+pluginManagement {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "org.jetbrains.kotlin.jvm") {
+                useModule("org.jetbrains.kotlin:kotlin-gradle-plugin:${requested.version}")
+            }
+        }
+    }
 }
+
 rootProject.name = "ChatBotChef"

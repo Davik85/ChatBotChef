@@ -1,7 +1,24 @@
+import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.bundling.Jar
+import org.gradle.kotlin.dsl.getByType
+import org.gradle.kotlin.dsl.named
+import org.gradle.kotlin.dsl.register
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+    }
+}
+
 plugins {
-    kotlin("jvm") version "2.0.21"
     application
 }
+
+apply(plugin = "org.jetbrains.kotlin.jvm")
 
 repositories {
     mavenCentral()
@@ -32,4 +49,43 @@ kotlin {
 
 application {
     mainClass.set("app.MainKt")
+}
+
+tasks.jar {
+    // Обычный jar будет «тонким». Выполнять можно через shadowJar (толстый).
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+}
+
+tasks.withType<Jar>().configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+val mainSourceSet = extensions.getByType<SourceSetContainer>().named("main")
+
+val shadowJar = tasks.register<Jar>("shadowJar") {
+    archiveClassifier.set("all")
+    group = "build"
+    description = "Assembles an executable fat JAR that bundles all runtime dependencies."
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+
+    from(mainSourceSet.map { it.output })
+    val runtimeClasspath = configurations.named("runtimeClasspath")
+    from({
+        runtimeClasspath.get().filter { it.isDirectory }
+    })
+    from({
+        runtimeClasspath.get()
+            .filter { it.isFile && it.extension == "jar" }
+            .map { zipTree(it) }
+    })
+}
+
+tasks.named("assemble") {
+    dependsOn(shadowJar)
 }
