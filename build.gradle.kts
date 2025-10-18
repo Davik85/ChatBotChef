@@ -1,18 +1,29 @@
 import org.gradle.api.file.DuplicatesStrategy
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.bundling.Jar
-import org.gradle.kotlin.dsl.getByName
+import org.gradle.kotlin.dsl.getByType
 import org.gradle.kotlin.dsl.named
 import org.gradle.kotlin.dsl.register
-import org.gradle.kotlin.dsl.the
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+    }
+}
 
 plugins {
-    kotlin("jvm") version "2.0.21"
     application
     id("com.github.johnrengelman.shadow") version "8.3.0" // сам плагин — без импортов его классов
 }
 
-repositories { mavenCentral() }
+apply(plugin = "org.jetbrains.kotlin.jvm")
+
+repositories {
+    mavenCentral()
+}
 
 dependencies {
     // DB
@@ -47,7 +58,7 @@ tasks.withType<Jar>().configureEach {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-val mainSourceSet = the<SourceSetContainer>().getByName("main")
+val mainSourceSet = extensions.getByType<SourceSetContainer>().named("main")
 
 val shadowJar = tasks.register<Jar>("shadowJar") {
     archiveClassifier.set("all")
@@ -59,7 +70,7 @@ val shadowJar = tasks.register<Jar>("shadowJar") {
         attributes["Main-Class"] = "app.MainKt"
     }
 
-    from(mainSourceSet.output)
+    from(mainSourceSet.map { it.output })
     val runtimeClasspath = configurations.named("runtimeClasspath")
     from({
         runtimeClasspath.get().filter { it.isDirectory }
