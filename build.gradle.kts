@@ -1,6 +1,11 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.api.tasks.bundling.Jar
+
 plugins {
     kotlin("jvm") version "2.0.21"
     application
+    id("com.github.johnrengelman.shadow") version "8.3.0"
 }
 
 repositories {
@@ -32,4 +37,19 @@ kotlin {
 
 application {
     mainClass.set("app.MainKt")
+}
+
+tasks.jar {
+    // Обычный jar будет «тонким». Выполнять можно через shadowJar (толстый).
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+}
+
+tasks.withType<Jar> {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named<ShadowJar>("shadowJar") {
+    archiveClassifier.set("all")
 }
