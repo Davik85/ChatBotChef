@@ -7,6 +7,7 @@ import org.gradle.kotlin.dsl.getByType
 plugins {
     kotlin("jvm") version "2.0.21"
     application
+    id("com.github.johnrengelman.shadow") version "8.3.0"
 }
 
 repositories {
