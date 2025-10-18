@@ -1,5 +1,4 @@
 import org.gradle.api.file.DuplicatesStrategy
-import org.gradle.api.plugins.LifecycleBasePlugin
 import org.gradle.api.tasks.SourceSetContainer
 import org.gradle.api.tasks.bundling.Jar
 import org.gradle.kotlin.dsl.getByName
@@ -52,7 +51,7 @@ val mainSourceSet = the<SourceSetContainer>().getByName("main")
 
 val shadowJar = tasks.register<Jar>("shadowJar") {
     archiveClassifier.set("all")
-    group = LifecycleBasePlugin.BUILD_GROUP
+    group = "build"
     description = "Assembles an executable fat JAR that bundles all runtime dependencies."
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
