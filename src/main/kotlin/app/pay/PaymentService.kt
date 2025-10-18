@@ -56,16 +56,21 @@ object PaymentService {
             return ValidationResult(false, "Этот счёт уже оплачен. Ожидайте подтверждения.")
         }
 
-        if (query.currency != SUPPORTED_CURRENCY) {
+        val expectedCurrency = record.currency.ifBlank { SUPPORTED_CURRENCY }
+        if (query.currency != expectedCurrency) {
             PaymentRepo.markFailure(payload, "currency_${query.currency}")
-            println("PAYMENT-WARN: invalid currency ${query.currency} for payload $payload")
-            return ValidationResult(false, "Платежи доступны только в рублях.")
+            println(
+                "PAYMENT-WARN: invalid currency ${query.currency} for payload $payload (expected $expectedCurrency)"
+            )
+            return ValidationResult(false, "Платежи доступны только в валюте $expectedCurrency.")
         }
 
-        val expectedAmount = expectedAmountMinor()
+        val expectedAmount = record.amountMinor.takeIf { it > 0 } ?: expectedAmountMinor()
         if (query.total_amount != expectedAmount) {
             PaymentRepo.markFailure(payload, "amount_${query.total_amount}")
-            println("PAYMENT-WARN: amount mismatch for $payload: expected $expectedAmount, got ${query.total_amount}")
+            println(
+                "PAYMENT-WARN: amount mismatch for $payload: expected $expectedAmount, got ${query.total_amount}"
+            )
             return ValidationResult(false, GENERIC_ERROR)
         }
 
