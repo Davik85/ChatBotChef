@@ -1,6 +1,8 @@
-import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import org.gradle.api.file.DuplicatesStrategy
 import org.gradle.api.tasks.bundling.Jar
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.kotlin.dsl.get
+import org.gradle.kotlin.dsl.getByType
 
 plugins {
     kotlin("jvm") version "2.0.21"
@@ -50,6 +52,18 @@ tasks.withType<Jar> {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-tasks.named<ShadowJar>("shadowJar") {
+val sourceSets = extensions.getByType<SourceSetContainer>()
+
+tasks.register<Jar>("shadowJar") {
+    dependsOn(configurations.runtimeClasspath)
     archiveClassifier.set("all")
+    manifest {
+        attributes["Main-Class"] = "app.MainKt"
+    }
+    from(sourceSets["main"].output)
+    from({
+        configurations.runtimeClasspath.get()
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    })
 }
