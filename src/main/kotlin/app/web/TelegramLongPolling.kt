@@ -316,9 +316,9 @@ class TelegramLongPolling(
 
         when (state[chatId]) {
             BotState.AWAITING_CALORIE_INPUT ->
-                if (!lower.startsWith("/")) { handleCalorieInput(chatId, msg.text ?: ""); return }
+                if (!lower.startsWith("/")) { handleCalorieInput(chatId, userId, msg.text ?: ""); return }
             BotState.AWAITING_PRODUCT_INPUT ->
-                if (!lower.startsWith("/")) { handleProductInput(chatId, msg.text ?: ""); return }
+                if (!lower.startsWith("/")) { handleProductInput(chatId, userId, msg.text ?: ""); return }
             else -> {}
         }
 
@@ -337,24 +337,24 @@ class TelegramLongPolling(
         }
 
         when (mode[chatId] ?: PersonaMode.CHEF) {
-            PersonaMode.CHEF    -> handleChef(chatId, msg.text ?: "")
-            PersonaMode.CALC    -> handleCalorieInput(chatId, msg.text ?: "")
-            PersonaMode.PRODUCT -> handleProductInput(chatId, msg.text ?: "")
+            PersonaMode.CHEF    -> handleChef(chatId, userId, msg.text ?: "")
+            PersonaMode.CALC    -> handleCalorieInput(chatId, userId, msg.text ?: "")
+            PersonaMode.PRODUCT -> handleProductInput(chatId, userId, msg.text ?: "")
         }
     }
 
     // ===== LLM =====
 
-    private fun handleChef(chatId: Long, userText: String) {
-        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) { sendPaywall(chatId); return }
+    private fun handleChef(chatId: Long, userId: Long, userText: String) {
+        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); return }
         val sys = ChatMessage("system", PersonaPrompt.system())
         val user = ChatMessage("user", userText)
         val reply = llm.complete(listOf(sys, user))
         api.sendMessage(chatId, reply)
     }
 
-    private fun handleCalorieInput(chatId: Long, userText: String) {
-        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) { sendPaywall(chatId); state.remove(chatId); return }
+    private fun handleCalorieInput(chatId: Long, userId: Long, userText: String) {
+        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
         val sys = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
         val user = ChatMessage("user", "Данные пользователя: $userText")
         val reply = llm.complete(listOf(sys, user))
@@ -362,8 +362,8 @@ class TelegramLongPolling(
         state.remove(chatId)
     }
 
-    private fun handleProductInput(chatId: Long, userText: String) {
-        if (!isAdmin(chatId) && !RateLimiter.checkAndConsume(chatId)) { sendPaywall(chatId); state.remove(chatId); return }
+    private fun handleProductInput(chatId: Long, userId: Long, userText: String) {
+        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
         val sys = ChatMessage("system", ProductInfoPrompt.SYSTEM)
         val user = ChatMessage("user", "Ингредиент: $userText")
         val reply = llm.complete(listOf(sys, user))
