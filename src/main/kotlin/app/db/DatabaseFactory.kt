@@ -328,7 +328,7 @@ object DatabaseFactory {
         transaction {
             SchemaUtils.createMissingTablesAndColumns(
                 Users, Messages, MemoryNotesV2, UserStats, ProcessedUpdates,
-                PremiumUsers, PremiumReminders, Payments
+                PremiumUsers, PremiumReminders, Payments, UsageCounters
             )
         }
     }

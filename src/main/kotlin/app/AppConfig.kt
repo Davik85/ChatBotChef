@@ -46,6 +46,7 @@ object AppConfig {
     const val OPENAI_URL = "https://api.openai.com/v1/chat/completions"
     const val OPENAI_MAX_TOKENS = 1800
     const val MAX_REPLY_CHARS = 1800
+    const val FREE_TOTAL_MSG_LIMIT = 3
     const val FREE_DAILY_MSG_LIMIT = 3
 
     // --- путь к sqlite ---
