@@ -49,7 +49,12 @@ class TelegramApi(private val token: String) {
     }
 
     fun sendMessage(chatId: Long, text: String, replyMarkup: InlineKeyboardMarkup? = null): Int? {
-        val args = mutableMapOf<String, Any>("chat_id" to chatId, "text" to text, "parse_mode" to "Markdown")
+        val limitedText = if (text.length > AppConfig.MAX_REPLY_CHARS) {
+            text.substring(0, AppConfig.MAX_REPLY_CHARS)
+        } else {
+            text
+        }
+        val args = mutableMapOf<String, Any>("chat_id" to chatId, "text" to limitedText, "parse_mode" to "Markdown")
         if (replyMarkup != null) args["reply_markup"] = replyMarkup
         val body = mapper.writeValueAsString(args).toRequestBody(json)
         val req = Request.Builder().url(url("sendMessage")).post(body).build()
