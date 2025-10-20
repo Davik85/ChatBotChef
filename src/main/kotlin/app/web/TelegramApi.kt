@@ -131,7 +131,7 @@ class TelegramApi(private val token: String) {
         title: String,
         description: String,
         payload: String,
-        providerToken: String,
+        providerToken: String?,
         currency: String,
         prices: List<TgLabeledPrice>,
         needEmail: Boolean = false,
@@ -140,11 +140,16 @@ class TelegramApi(private val token: String) {
         sendPhoneToProvider: Boolean = false,
         providerData: Map<String, Any>? = null,
     ): Boolean {
+        if (providerToken.isNullOrBlank()) {
+            println("PAYMENT-ERR: providerToken is empty")
+            return false
+        }
+
         val args = mutableMapOf<String, Any>(
             "chat_id" to chatId,
-            "title" to title,
-            "description" to description,
-            "payload" to payload,
+            "title" to title.take(32),
+            "description" to description.take(255),
+            "payload" to payload.take(128),
             "provider_token" to providerToken,
             "currency" to currency,
             "prices" to prices
@@ -153,14 +158,35 @@ class TelegramApi(private val token: String) {
         if (needPhone) args["need_phone_number"] = true
         if (sendEmailToProvider) args["send_email_to_provider"] = true
         if (sendPhoneToProvider) args["send_phone_number_to_provider"] = true
-        if (providerData != null) args["provider_data"] = providerData
+        if (providerData != null) {
+            args["provider_data"] = mapper.writeValueAsString(providerData)
+        }
 
-        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val reqJson = mapper.writeValueAsString(args)
+        val reqJsonSafe = reqJson.replace(
+            Regex("(?i)\"provider_token\"\\s*:\\s*\"[^\"]+\""),
+            "\"provider_token\":\"***\""
+        )
+        val body = reqJson.toRequestBody(json)
         val req = Request.Builder().url(url("sendInvoice")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
-            return parsed.ok && parsed.result != null
+            if (!r.isSuccessful) {
+                println("TG-HTTP-ERR sendInvoice: code=${'$'}{r.code} body=${'$'}raw")
+                return false
+            }
+            return try {
+                val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                if (!parsed.ok) {
+                    val errorCode = parsed.error_code?.toString() ?: "unknown"
+                    val description = parsed.description ?: "unknown"
+                    println("TG-API-ERR sendInvoice: error_code=${'$'}errorCode description=${'$'}description raw=${'$'}raw req=${'$'}reqJsonSafe")
+                }
+                parsed.ok
+            } catch (t: Throwable) {
+                println("TG-JSON-ERR sendInvoice: ${'$'}{t.message} raw=${'$'}raw req=${'$'}reqJsonSafe")
+                false
+            }
         }
     }
 
