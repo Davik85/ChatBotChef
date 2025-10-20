@@ -73,6 +73,21 @@ object Payments : Table(name = "payments") {
     override val primaryKey = PrimaryKey(payload)
 }
 
+object ChatHistory : Table(name = "chat_history") {
+    val id = long("id").autoIncrement()
+    val user_id = long("user_id").index()
+    val mode = varchar("mode", length = 16).index()
+    val role = varchar("role", length = 10)
+    val text = text("text")
+    val ts = long("ts")
+
+    init {
+        index(isUnique = false, columns = arrayOf(user_id, mode))
+    }
+
+    override val primaryKey = PrimaryKey(id)
+}
+
 object DatabaseFactory {
 
     fun init() {
@@ -328,7 +343,7 @@ object DatabaseFactory {
         transaction {
             SchemaUtils.createMissingTablesAndColumns(
                 Users, Messages, MemoryNotesV2, UserStats, ProcessedUpdates,
-                PremiumUsers, PremiumReminders, Payments, UsageCounters
+                PremiumUsers, PremiumReminders, Payments, UsageCounters, ChatHistory
             )
         }
     }
