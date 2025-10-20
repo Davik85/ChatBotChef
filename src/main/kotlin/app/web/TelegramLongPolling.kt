@@ -1,6 +1,7 @@
 package app.web
 
 import app.AppConfig
+import app.db.ChatHistoryRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
 import app.logic.PersonaPrompt
@@ -19,6 +20,7 @@ import app.logic.RateLimiter
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.ArrayDeque
 
 class TelegramLongPolling(
     private val token: String,
@@ -112,9 +114,54 @@ class TelegramLongPolling(
         private const val HOUR_MS = 60 * 60 * 1000L
         private const val DAY_MS = 24 * HOUR_MS
         private const val REMINDER_PERIOD_MS = HOUR_MS
+        private val CTRL_REGEX = Regex("[\\u0000-\\u001F\\u007F\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000]")
     }
 
     private fun isAdmin(userId: Long): Boolean = ADMIN_IDS.contains(userId)
+
+    private fun PersonaMode.modeKey(): String = when (this) {
+        PersonaMode.CHEF -> "CHEF"
+        PersonaMode.CALC -> "CALC"
+        PersonaMode.PRODUCT -> "PRODUCT"
+    }
+
+    private fun currentMode(chatId: Long): PersonaMode = mode[chatId] ?: PersonaMode.CHEF
+
+    private fun prepareForHistory(raw: String): String {
+        if (raw.isEmpty()) return raw
+        var value = raw.replace("\r", " ").replace("\n", " ")
+        value = CTRL_REGEX.replace(value, "")
+        if (value.length > AppConfig.HISTORY_MAX_CHARS_PER_MSG) {
+            value = value.take(AppConfig.HISTORY_MAX_CHARS_PER_MSG)
+        }
+        return value.trim()
+    }
+
+    private fun buildHistoryMessages(userId: Long, personaMode: PersonaMode): List<ChatMessage> {
+        val items = ChatHistoryRepo.fetchLast(userId, personaMode.modeKey(), AppConfig.HISTORY_MAX_TURNS)
+        if (items.isEmpty()) return emptyList()
+
+        val deque = ArrayDeque<Pair<ChatMessage, Int>>()
+        var total = 0
+        for (item in items) {
+            val sanitized = prepareForHistory(item.text)
+            if (sanitized.isEmpty()) continue
+            val message = ChatMessage(item.role, sanitized)
+            deque.addLast(message to sanitized.length)
+            total += sanitized.length
+            while (total > AppConfig.HISTORY_MAX_TOTAL_CHARS && deque.isNotEmpty()) {
+                val removed = deque.removeFirst()
+                total -= removed.second
+            }
+        }
+        return deque.map { it.first }
+    }
+
+    private fun clearAllHistory(userId: Long) {
+        PersonaMode.values().forEach { persona ->
+            ChatHistoryRepo.clear(userId, persona.modeKey())
+        }
+    }
 
     private var lastReminderCheck = 0L
 
@@ -230,6 +277,7 @@ class TelegramLongPolling(
     private fun handleCallback(cb: TgCallbackQuery) {
         val chatId = cb.message?.chat?.id ?: return
         val msgId = cb.message.message_id
+        val userId = cb.from.id
 
         when (cb.data) {
             CB_RECIPES -> {
@@ -238,6 +286,7 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
+                ChatHistoryRepo.clear(userId, PersonaMode.CHEF.modeKey())
                 api.sendMessage(chatId, CHEF_INPUT_PROMPT)
             }
             CB_CALC -> {
@@ -246,6 +295,7 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 mode[chatId] = PersonaMode.CALC
                 state[chatId] = BotState.AWAITING_CALORIE_INPUT
+                ChatHistoryRepo.clear(userId, PersonaMode.CALC.modeKey())
                 api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
             }
             CB_PRODUCT -> {
@@ -254,6 +304,7 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 mode[chatId] = PersonaMode.PRODUCT
                 state[chatId] = BotState.AWAITING_PRODUCT_INPUT
+                ChatHistoryRepo.clear(userId, PersonaMode.PRODUCT.modeKey())
                 api.sendMessage(chatId, PRODUCT_INPUT_PROMPT)
             }
             CB_HELP -> {
@@ -327,16 +378,41 @@ class TelegramLongPolling(
                 api.deleteMessage(chatId, msgId)
                 mode[chatId] = PersonaMode.CHEF
                 state.remove(chatId)
+                clearAllHistory(userId)
                 api.sendPhotoResource(chatId, START_IMAGE_RES, START_GREETING_RU, inlineMenu())
                 return
             }
-            "/recipes" -> { mode[chatId] = PersonaMode.CHEF; state.remove(chatId); api.sendMessage(chatId, CHEF_INPUT_PROMPT); return }
-            "/caloriecalculator" -> { mode[chatId] = PersonaMode.CALC; state[chatId] = BotState.AWAITING_CALORIE_INPUT; api.sendMessage(chatId, CALORIE_INPUT_PROMPT); return }
-            "/productinfo" -> { mode[chatId] = PersonaMode.PRODUCT; state[chatId] = BotState.AWAITING_PRODUCT_INPUT; api.sendMessage(chatId, PRODUCT_INPUT_PROMPT); return }
+            "/recipes" -> {
+                mode[chatId] = PersonaMode.CHEF
+                state.remove(chatId)
+                ChatHistoryRepo.clear(userId, PersonaMode.CHEF.modeKey())
+                api.sendMessage(chatId, CHEF_INPUT_PROMPT)
+                return
+            }
+            "/caloriecalculator" -> {
+                mode[chatId] = PersonaMode.CALC
+                state[chatId] = BotState.AWAITING_CALORIE_INPUT
+                ChatHistoryRepo.clear(userId, PersonaMode.CALC.modeKey())
+                api.sendMessage(chatId, CALORIE_INPUT_PROMPT)
+                return
+            }
+            "/productinfo" -> {
+                mode[chatId] = PersonaMode.PRODUCT
+                state[chatId] = BotState.AWAITING_PRODUCT_INPUT
+                ChatHistoryRepo.clear(userId, PersonaMode.PRODUCT.modeKey())
+                api.sendMessage(chatId, PRODUCT_INPUT_PROMPT)
+                return
+            }
             "/help" -> { api.sendMessage(chatId, HELP_TEXT); return }
+            "/reset" -> {
+                val current = currentMode(chatId)
+                ChatHistoryRepo.clear(userId, current.modeKey())
+                api.sendMessage(chatId, "Контекст очищен")
+                return
+            }
         }
 
-        when (mode[chatId] ?: PersonaMode.CHEF) {
+        when (currentMode(chatId)) {
             PersonaMode.CHEF    -> handleChef(chatId, userId, msg.text ?: "")
             PersonaMode.CALC    -> handleCalorieInput(chatId, userId, msg.text ?: "")
             PersonaMode.PRODUCT -> handleProductInput(chatId, userId, msg.text ?: "")
@@ -347,27 +423,63 @@ class TelegramLongPolling(
 
     private fun handleChef(chatId: Long, userId: Long, userText: String) {
         if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); return }
-        val sys = ChatMessage("system", PersonaPrompt.system())
-        val user = ChatMessage("user", userText)
-        val reply = llm.complete(listOf(sys, user))
+        val persona = PersonaMode.CHEF
+        val history = buildHistoryMessages(userId, persona)
+        val preparedUser = prepareForHistory(userText)
+        val messages = mutableListOf(ChatMessage("system", PersonaPrompt.system()))
+        messages.addAll(history)
+        messages += ChatMessage("user", preparedUser)
+        val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+
+        if (preparedUser.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
+        }
+        val assistantPrepared = prepareForHistory(reply)
+        if (assistantPrepared.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "assistant", assistantPrepared)
+        }
     }
 
     private fun handleCalorieInput(chatId: Long, userId: Long, userText: String) {
         if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
-        val sys = ChatMessage("system", CalorieCalculatorPrompt.SYSTEM)
-        val user = ChatMessage("user", "Данные пользователя: $userText")
-        val reply = llm.complete(listOf(sys, user))
+        val persona = PersonaMode.CALC
+        val history = buildHistoryMessages(userId, persona)
+        val userPayload = "Данные пользователя: $userText"
+        val preparedUser = prepareForHistory(userPayload)
+        val messages = mutableListOf(ChatMessage("system", CalorieCalculatorPrompt.SYSTEM))
+        messages.addAll(history)
+        messages += ChatMessage("user", preparedUser)
+        val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+        if (preparedUser.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
+        }
+        val assistantPrepared = prepareForHistory(reply)
+        if (assistantPrepared.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "assistant", assistantPrepared)
+        }
         state.remove(chatId)
     }
 
     private fun handleProductInput(chatId: Long, userId: Long, userText: String) {
         if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
-        val sys = ChatMessage("system", ProductInfoPrompt.SYSTEM)
-        val user = ChatMessage("user", "Ингредиент: $userText")
-        val reply = llm.complete(listOf(sys, user))
+        val persona = PersonaMode.PRODUCT
+        val history = buildHistoryMessages(userId, persona)
+        val userPayload = "Ингредиент: $userText"
+        val preparedUser = prepareForHistory(userPayload)
+        val messages = mutableListOf(ChatMessage("system", ProductInfoPrompt.SYSTEM))
+        messages.addAll(history)
+        messages += ChatMessage("user", preparedUser)
+        val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+        if (preparedUser.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
+        }
+        val assistantPrepared = prepareForHistory(reply)
+        if (assistantPrepared.isNotEmpty()) {
+            ChatHistoryRepo.append(userId, persona.modeKey(), "assistant", assistantPrepared)
+        }
         state.remove(chatId)
     }
 
