@@ -23,6 +23,8 @@ class TelegramApi(private val token: String) {
 
     private fun url(method: String) = "${AppConfig.TELEGRAM_BASE}/bot$token/$method"
     private val json = "application/json; charset=utf-8".toMediaType()
+    private val debugPaymentsLogging =
+        (System.getenv("DEBUG") ?: System.getProperty("DEBUG"))?.equals("true", ignoreCase = true) == true
 
     fun getMe(): Boolean {
         val req = Request.Builder().url(url("getMe")).get().build()
@@ -167,12 +169,18 @@ class TelegramApi(private val token: String) {
             Regex("(?i)\"provider_token\"\\s*:\\s*\"[^\"]+\""),
             "\"provider_token\":\"***\""
         )
+        if (debugPaymentsLogging) {
+            println("PAYMENT-WARN: sendInvoice debug request=$reqJsonSafe")
+        }
         val body = reqJson.toRequestBody(json)
         val req = Request.Builder().url(url("sendInvoice")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
+            if (debugPaymentsLogging) {
+                println("PAYMENT-WARN: sendInvoice debug response_code=${r.code} body=$raw")
+            }
             if (!r.isSuccessful) {
-                println("TG-HTTP-ERR sendInvoice: code=${'$'}{r.code} body=${'$'}raw")
+                println("TG-HTTP-ERR sendInvoice: code=${r.code} body=$raw req=$reqJsonSafe")
                 return false
             }
             return try {
@@ -180,11 +188,11 @@ class TelegramApi(private val token: String) {
                 if (!parsed.ok) {
                     val errorCode = parsed.error_code?.toString() ?: "unknown"
                     val description = parsed.description ?: "unknown"
-                    println("TG-API-ERR sendInvoice: error_code=${'$'}errorCode description=${'$'}description raw=${'$'}raw req=${'$'}reqJsonSafe")
+                    println("TG-API-ERR sendInvoice: error_code=$errorCode description=$description raw=$raw req=$reqJsonSafe")
                 }
                 parsed.ok
             } catch (t: Throwable) {
-                println("TG-JSON-ERR sendInvoice: ${'$'}{t.message} raw=${'$'}raw req=${'$'}reqJsonSafe")
+                println("TG-JSON-ERR sendInvoice: ${t.message} raw=$raw req=$reqJsonSafe")
                 false
             }
         }
