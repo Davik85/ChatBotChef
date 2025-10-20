@@ -106,7 +106,7 @@ object AppConfig {
     val paymentSubject: String by lazy { clean(readRaw("PAYMENT_SUBJECT")) ?: "service" }    // service / commodity / ...
     val paymentMode: String by lazy { clean(readRaw("PAYMENT_MODE")) ?: "full_prepayment" }  // full_prepayment / ...
     val requirePhoneForReceipt: Boolean by lazy {
-        if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_PHONE_FOR_RECEIPT") ?: false
+        if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_PHONE_FOR_RECEIPT") ?: true
     }
     val requireEmailForReceipt: Boolean by lazy {
         if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_EMAIL_FOR_RECEIPT") ?: true
