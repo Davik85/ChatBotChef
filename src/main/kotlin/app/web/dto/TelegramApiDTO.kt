@@ -7,7 +7,9 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TgApiResp<T>(
     val ok: Boolean,
-    val result: T?
+    val result: T? = null,
+    val error_code: Int? = null,
+    val description: String? = null
 )
 
 // ==== ОБЪЕКТЫ СООБЩЕНИЙ/ЧАТА/ПОЛЬЗОВАТЕЛЯ ====
