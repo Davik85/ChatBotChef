@@ -46,8 +46,8 @@ object AppConfig {
     const val OPENAI_URL = "https://api.openai.com/v1/chat/completions"
     const val OPENAI_MAX_TOKENS = 1800
     const val MAX_REPLY_CHARS = 1800
-    const val FREE_TOTAL_MSG_LIMIT = 3
-    const val FREE_DAILY_MSG_LIMIT = 3
+    const val FREE_TOTAL_MSG_LIMIT = 10
+    const val FREE_DAILY_MSG_LIMIT = 10
     const val HISTORY_MAX_TURNS = 30
     const val HISTORY_MAX_CHARS_PER_MSG = 1000
     const val HISTORY_MAX_TOTAL_CHARS = 12_000
