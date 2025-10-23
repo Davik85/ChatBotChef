@@ -1,12 +1,21 @@
 package app.db
 
-import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.between
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.deleteWhere
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
 import kotlin.math.max
 
 object PremiumRepo {
+
+    fun isActive(userId: Long): Boolean {
+        val until = getUntil(userId) ?: return false
+        return until > System.currentTimeMillis()
+    }
 
     fun getUntil(userId: Long): Long? = transaction {
         PremiumUsers
@@ -33,37 +42,31 @@ object PremiumRepo {
                 it[until_ts] = newUntil
             }
         }
-        // Сбрасываем отметки напоминаний, чтобы на новый период снова прислать 3d/1d/0d
         PremiumReminders.deleteWhere { PremiumReminders.user_id eq userId }
     }
 
-    // --- Напоминания ---
-
-    fun listExpiringBetween(fromMs: Long, toMs: Long, kind: String): List<Long> = transaction {
-        // выбираем кандидатов по периоду
-        val candidates = PremiumUsers
-            .slice(PremiumUsers.user_id)
-            .select { PremiumUsers.until_ts.between(fromMs, toMs) }
-            .map { it[PremiumUsers.user_id] }
-
-        if (candidates.isEmpty()) return@transaction emptyList<Long>()
-
-        // убираем тех, кому уже слали это напоминание
-        val already = PremiumReminders
-            .slice(PremiumReminders.user_id)
-            .select { (PremiumReminders.user_id inList candidates) and (PremiumReminders.kind eq kind) }
-            .map { it[PremiumReminders.user_id] }
-            .toSet()
-
-        candidates.filterNot { already.contains(it) }
-    }
-
-    /** Помечаем, что отправили напоминание */
-    fun markReminded(userId: Long, kind: String) = transaction {
-        PremiumReminders.insertIgnore {
+    fun markReminderSent(userId: Long, kind: String): Boolean = transaction {
+        val exists = PremiumReminders
+            .select { (PremiumReminders.user_id eq userId) and (PremiumReminders.kind eq kind) }
+            .limit(1)
+            .count() > 0
+        if (exists) return@transaction false
+        PremiumReminders.insert {
             it[PremiumReminders.user_id] = userId
             it[PremiumReminders.kind] = kind
             it[sent_ts] = System.currentTimeMillis()
+        }
+        true
+    }
+
+    fun forEachExpiringInWindow(fromMs: Long, toMs: Long, cb: (Long, Long) -> Unit) {
+        transaction {
+            PremiumUsers
+                .slice(PremiumUsers.user_id, PremiumUsers.until_ts)
+                .select { PremiumUsers.until_ts.between(fromMs, toMs) }
+                .forEach { row ->
+                    cb(row[PremiumUsers.user_id], row[PremiumUsers.until_ts])
+                }
         }
     }
 }

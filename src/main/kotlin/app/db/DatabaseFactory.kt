@@ -337,6 +337,14 @@ object DatabaseFactory {
                 addColumnIfMissing("payments", "updated_at INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("payments", "user_id INTEGER NOT NULL DEFAULT 0")
             }
+            if (tableExists("usage_counters")) {
+                addColumnIfMissing("usage_counters", "total_used INTEGER NOT NULL DEFAULT 0")
+                val hasUsed = columnExists("usage_counters", "used")
+                val hasTotal = columnExists("usage_counters", "total_used")
+                if (hasUsed && hasTotal) {
+                    exec("UPDATE usage_counters SET total_used = used WHERE total_used = 0;")
+                }
+            }
         }
 
         // 5) добиваем недостающие объекты штатно
