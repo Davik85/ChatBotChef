@@ -102,6 +102,8 @@ class TelegramLongPolling(
             Отправьте чек, свой ID (введите команду /whoami в бот) и краткое описание проблемы.
 
             Сайт проекта: http://ai-chef.tilda.ws/
+            Политика конфиденциальности: https://ai-chef.tilda.ws/policy
+            Оферта: https://ai-chef.tilda.ws/oferta
             Почта поддержки: ai.chef@yandex.ru
         """.trimIndent()
 
