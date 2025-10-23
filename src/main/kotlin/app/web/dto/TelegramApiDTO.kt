@@ -42,12 +42,94 @@ data class TgSuccessfulPayment(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class TgPhotoSize(
+    val file_id: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val file_unique_id: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgDocument(
+    val file_id: String,
+    val file_name: String? = null,
+    val mime_type: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgVideo(
+    val file_id: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val duration: Int? = null,
+    val mime_type: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgVideoNote(
+    val file_id: String,
+    val length: Int? = null,
+    val duration: Int? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgVoice(
+    val file_id: String,
+    val duration: Int? = null,
+    val mime_type: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgAudio(
+    val file_id: String,
+    val duration: Int? = null,
+    val performer: String? = null,
+    val title: String? = null,
+    val mime_type: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgSticker(
+    val file_id: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val emoji: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgAnimation(
+    val file_id: String,
+    val width: Int? = null,
+    val height: Int? = null,
+    val duration: Int? = null,
+    val file_name: String? = null,
+    val mime_type: String? = null,
+    val file_size: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class TgMessage(
     val message_id: Int,
     val from: TgUser? = null,
     val chat: TgChat,
     val date: Long? = null,
     val text: String? = null,
+
+    val photo: List<TgPhotoSize>? = null,
+    val document: TgDocument? = null,
+    val video: TgVideo? = null,
+    val video_note: TgVideoNote? = null,
+    val voice: TgVoice? = null,
+    val audio: TgAudio? = null,
+    val sticker: TgSticker? = null,
+    val animation: TgAnimation? = null,
 
     // Платёж
     val successful_payment: TgSuccessfulPayment? = null,

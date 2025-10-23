@@ -4,17 +4,20 @@ import app.AppConfig
 import app.db.ChatHistoryRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
-import app.logic.PersonaPrompt
 import app.logic.CalorieCalculatorPrompt
+import app.logic.PersonaPrompt
 import app.logic.ProductInfoPrompt
 import app.pay.PaymentService
 import app.pay.ReceiptBuilder
+import app.notify.ReminderJob
 import app.web.dto.InlineKeyboardButton
 import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
 import app.web.dto.*
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import app.db.PremiumRepo
 import app.logic.RateLimiter
 import java.time.Instant
@@ -39,7 +42,6 @@ class TelegramLongPolling(
         private const val CB_CALC = "menu_calc"
         private const val CB_PRODUCT = "menu_product"
         private const val CB_HELP = "menu_help"
-        private const val CB_PAY_NOW = "menu_pay_now"
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Я Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -112,9 +114,6 @@ class TelegramLongPolling(
         private val dtf: DateTimeFormatter =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
 
-        private const val HOUR_MS = 60 * 60 * 1000L
-        private const val DAY_MS = 24 * HOUR_MS
-        private const val REMINDER_PERIOD_MS = HOUR_MS
         private val CTRL_REGEX = Regex("[\\u0000-\\u001F\\u007F\\u00A0\\u2000-\\u200B\\u202F\\u205F\\u3000]")
     }
 
@@ -164,20 +163,13 @@ class TelegramLongPolling(
         }
     }
 
-    private var lastReminderCheck = 0L
-
     suspend fun run() {
         require(api.getMe()) { "Telegram getMe failed" }
+        GlobalScope.launch { ReminderJob(api).runForever() }
         var offset: Long? = null
 
         while (true) {
             try {
-                val now = System.currentTimeMillis()
-                if (now - lastReminderCheck >= REMINDER_PERIOD_MS) {
-                    tickRenewalReminders(now)
-                    lastReminderCheck = now
-                }
-
                 val updates: List<TgUpdate> = api.getUpdates(offset)
                 if (updates.isEmpty()) { delay(1200); continue }
 
@@ -201,8 +193,6 @@ class TelegramLongPolling(
                         handleSuccessfulPayment(msg); continue
                     }
 
-                    val text = msg.text?.trim().orEmpty()
-                    if (text.isBlank()) continue
                     route(msg)
                 }
             } catch (t: Throwable) {
@@ -314,12 +304,6 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 api.sendMessage(chatId, HELP_TEXT)
             }
-            CB_PAY_NOW -> {
-                api.answerCallback(cb.id)
-                api.deleteMessage(chatId, msgId)
-                val ok = sendTelegramInvoice(chatId)
-                if (!ok && PaymentService.paymentsAvailable) api.sendMessage(chatId, "Не удалось отправить счёт. Попробуйте позже.")
-            }
         }
     }
 
@@ -329,7 +313,23 @@ class TelegramLongPolling(
         val chatId = msg.chat.id
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
-        val lower = msg.text?.lowercase().orEmpty()
+
+        val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
+            msg.document != null ||
+            msg.video != null ||
+            msg.video_note != null ||
+            msg.voice != null ||
+            msg.audio != null ||
+            msg.sticker != null ||
+            msg.animation != null
+        if (hasAttachments) {
+            api.sendMessage(chatId, "Я принимаю только текстовые запросы. Пожалуйста, пришлите текст.")
+            return
+        }
+
+        val text = msg.text?.trim().orEmpty()
+        if (text.isBlank()) return
+        val lower = text.lowercase()
 
         // ADMIN
         if (lower.startsWith("/premiumstatus")) {
@@ -368,9 +368,9 @@ class TelegramLongPolling(
 
         when (state[chatId]) {
             BotState.AWAITING_CALORIE_INPUT ->
-                if (!lower.startsWith("/")) { handleCalorieInput(chatId, userId, msg.text ?: ""); return }
+                if (!lower.startsWith("/")) { handleCalorieInput(chatId, userId, text); return }
             BotState.AWAITING_PRODUCT_INPUT ->
-                if (!lower.startsWith("/")) { handleProductInput(chatId, userId, msg.text ?: ""); return }
+                if (!lower.startsWith("/")) { handleProductInput(chatId, userId, text); return }
             else -> {}
         }
 
@@ -414,16 +414,20 @@ class TelegramLongPolling(
         }
 
         when (currentMode(chatId)) {
-            PersonaMode.CHEF    -> handleChef(chatId, userId, msg.text ?: "")
-            PersonaMode.CALC    -> handleCalorieInput(chatId, userId, msg.text ?: "")
-            PersonaMode.PRODUCT -> handleProductInput(chatId, userId, msg.text ?: "")
+            PersonaMode.CHEF    -> handleChef(chatId, userId, text)
+            PersonaMode.CALC    -> handleCalorieInput(chatId, userId, text)
+            PersonaMode.PRODUCT -> handleProductInput(chatId, userId, text)
         }
     }
 
     // ===== LLM =====
 
     private fun handleChef(chatId: Long, userId: Long, userText: String) {
-        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); return }
+        val isAdminUser = isAdmin(userId)
+        if (!RateLimiter.allow(chatId, isAdminUser)) {
+            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
+            return
+        }
         val persona = PersonaMode.CHEF
         val history = buildHistoryMessages(userId, persona)
         val preparedUser = prepareForHistory(userText)
@@ -432,6 +436,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+        RateLimiter.consumeIfFree(chatId, isAdminUser)
 
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
@@ -443,7 +448,12 @@ class TelegramLongPolling(
     }
 
     private fun handleCalorieInput(chatId: Long, userId: Long, userText: String) {
-        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
+        val isAdminUser = isAdmin(userId)
+        if (!RateLimiter.allow(chatId, isAdminUser)) {
+            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
+            state.remove(chatId)
+            return
+        }
         val persona = PersonaMode.CALC
         val history = buildHistoryMessages(userId, persona)
         val userPayload = "Данные пользователя: $userText"
@@ -453,6 +463,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+        RateLimiter.consumeIfFree(chatId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
         }
@@ -464,7 +475,12 @@ class TelegramLongPolling(
     }
 
     private fun handleProductInput(chatId: Long, userId: Long, userText: String) {
-        if (!isAdmin(userId) && !RateLimiter.checkAndConsume(userId)) { sendPaywall(chatId); state.remove(chatId); return }
+        val isAdminUser = isAdmin(userId)
+        if (!RateLimiter.allow(chatId, isAdminUser)) {
+            api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
+            state.remove(chatId)
+            return
+        }
         val persona = PersonaMode.PRODUCT
         val history = buildHistoryMessages(userId, persona)
         val userPayload = "Ингредиент: $userText"
@@ -474,6 +490,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
+        RateLimiter.consumeIfFree(chatId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
         }
@@ -484,18 +501,6 @@ class TelegramLongPolling(
         state.remove(chatId)
     }
 
-    private fun sendPaywall(chatId: Long) {
-        if (!PaymentService.paymentsAvailable) {
-            api.sendMessage(chatId, PaymentService.paymentsDisabledMessage)
-            return
-        }
-        val kb = InlineKeyboardMarkup(
-            inline_keyboard = listOf(
-                listOf(InlineKeyboardButton("Оплатить в Telegram", CB_PAY_NOW))
-            )
-        )
-        api.sendMessage(chatId, AppConfig.PAYWALL_TEXT, replyMarkup = kb)
-    }
 
     private fun inlineMenu(): InlineKeyboardMarkup =
         InlineKeyboardMarkup(
@@ -506,51 +511,4 @@ class TelegramLongPolling(
                 listOf(InlineKeyboardButton("Помощь", CB_HELP))
             )
         )
-
-    // ===== напоминания о продлении =====
-    private fun tickRenewalReminders(now: Long) {
-        // Здесь предполагается реализация PremiumRepo.listExpiringBetween(...) и markReminded(...)
-        // Если у тебя уже сделано — будет работать. Иначе можно отключить вызов tickRenewalReminders().
-        val hour = HOUR_MS
-        fun window(center: Long) = center - hour to center + hour
-
-        // 3 дня
-        kotlin.run {
-            val (from, to) = window(now + 3 * DAY_MS)
-            PremiumRepo.listExpiringBetween(from, to, "3d").forEach { id ->
-                PremiumRepo.markReminded(id, "3d")
-                sendReminder(id, "Подписка истекает через 3 дня. Продлите, чтобы не потерять доступ.")
-            }
-        }
-        // 1 день
-        kotlin.run {
-            val (from, to) = window(now + DAY_MS)
-            PremiumRepo.listExpiringBetween(from, to, "1d").forEach { id ->
-                PremiumRepo.markReminded(id, "1d")
-                sendReminder(id, "Подписка истекает завтра. Продлите подписку, доступ сохранится без перерывов.")
-            }
-        }
-        // Сегодня
-        kotlin.run {
-            val from = now
-            val to = now + DAY_MS
-            PremiumRepo.listExpiringBetween(from, to, "0d").forEach { id ->
-                PremiumRepo.markReminded(id, "0d")
-                sendReminder(id, "Подписка заканчивается сегодня. Нажмите, чтобы продлить в Telegram.")
-            }
-        }
-    }
-
-    private fun sendReminder(userId: Long, text: String) {
-        if (!PaymentService.paymentsAvailable) {
-            api.sendMessage(userId, PaymentService.paymentsDisabledMessage)
-            return
-        }
-        val kb = InlineKeyboardMarkup(
-            inline_keyboard = listOf(
-                listOf(InlineKeyboardButton("Оплатить в Telegram", CB_PAY_NOW))
-            )
-        )
-        api.sendMessage(userId, text, replyMarkup = kb)
-    }
 }
