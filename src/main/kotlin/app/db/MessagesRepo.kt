@@ -27,11 +27,13 @@ object MessagesRepo {
         } else {
             text
         }
+        val trimmed = normalized.trim()
+        if (trimmed.isEmpty()) return@transaction
         val safeRole = normalizeRole(role)
         Messages.insert {
             it[Messages.user_id] = userId
             it[Messages.ts] = ts
-            it[Messages.text] = normalized
+            it[Messages.text] = trimmed
             it[Messages.role] = safeRole
         }
     }
@@ -45,5 +47,16 @@ object MessagesRepo {
             ?.get(distinctUsers)
             ?.toLong()
             ?: 0L
+    }
+
+    fun countUserMessagesSince(userId: Long, fromMs: Long): Long = transaction {
+        Messages
+            .select {
+                (Messages.user_id eq userId) and
+                    (Messages.ts.greaterEq(fromMs)) and
+                    (Messages.role eq "user")
+            }
+            .count()
+            .toLong()
     }
 }

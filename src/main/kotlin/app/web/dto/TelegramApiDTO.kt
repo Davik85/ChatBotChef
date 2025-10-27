@@ -9,7 +9,13 @@ data class TgApiResp<T>(
     val ok: Boolean,
     val result: T? = null,
     val error_code: Int? = null,
-    val description: String? = null
+    val description: String? = null,
+    val parameters: TgResponseParameters? = null,
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgResponseParameters(
+    val retry_after: Int? = null,
 )
 
 // ==== ОБЪЕКТЫ СООБЩЕНИЙ/ЧАТА/ПОЛЬЗОВАТЕЛЯ ====
@@ -121,6 +127,7 @@ data class TgMessage(
     val chat: TgChat,
     val date: Long? = null,
     val text: String? = null,
+    val caption: String? = null,
 
     val photo: List<TgPhotoSize>? = null,
     val document: TgDocument? = null,

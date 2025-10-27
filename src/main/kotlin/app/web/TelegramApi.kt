@@ -13,6 +13,14 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.time.Duration
 
+data class TelegramSendResult(
+    val ok: Boolean,
+    val messageId: Int? = null,
+    val errorCode: Int? = null,
+    val description: String? = null,
+    val retryAfterSeconds: Int? = null,
+)
+
 class TelegramApi(private val token: String) {
     private val mapper = jacksonObjectMapper()
     private val client = OkHttpClient.Builder()
@@ -56,7 +64,15 @@ class TelegramApi(private val token: String) {
         replyMarkup: InlineKeyboardMarkup? = null,
         parseMode: String? = "Markdown",
         maxChars: Int = AppConfig.MAX_REPLY_CHARS
-    ): Int? {
+    ): Int? = sendMessageDetailed(chatId, text, replyMarkup, parseMode, maxChars).messageId
+
+    fun sendMessageDetailed(
+        chatId: Long,
+        text: String,
+        replyMarkup: InlineKeyboardMarkup? = null,
+        parseMode: String? = "Markdown",
+        maxChars: Int = AppConfig.MAX_REPLY_CHARS
+    ): TelegramSendResult {
         val limitedText = if (maxChars > 0 && text.length > maxChars) {
             text.substring(0, maxChars)
         } else {
@@ -71,8 +87,25 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendMessage")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
-            return parsed.result?.message_id
+            return try {
+                val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                val success = parsed.ok && r.isSuccessful
+                TelegramSendResult(
+                    ok = success,
+                    messageId = parsed.result?.message_id,
+                    errorCode = if (success) null else parsed.error_code ?: r.code,
+                    description = parsed.description ?: if (r.isSuccessful) null else "HTTP ${r.code}",
+                    retryAfterSeconds = parsed.parameters?.retry_after,
+                )
+            } catch (e: Exception) {
+                TelegramSendResult(
+                    ok = r.isSuccessful,
+                    messageId = null,
+                    errorCode = if (r.isSuccessful) null else r.code,
+                    description = if (r.isSuccessful) "json_parse_error: ${e.message}" else "HTTP ${r.code}",
+                    retryAfterSeconds = null,
+                )
+            }
         }
     }
 
