@@ -11,6 +11,7 @@ import java.sql.Connection
 object Users : Table(name = "users") {
     val user_id = long("user_id").uniqueIndex()
     val first_seen = long("first_seen")
+    val blocked_ts = long("blocked_ts").default(0)
     override val primaryKey = PrimaryKey(user_id)
 }
 
@@ -165,14 +166,42 @@ object DatabaseFactory {
                     exec("""
                         CREATE TABLE users_new(
                             user_id    INTEGER PRIMARY KEY,
-                            first_seen INTEGER NOT NULL
+                            first_seen INTEGER NOT NULL,
+                            blocked_ts INTEGER NOT NULL DEFAULT 0
                         );
                     """.trimIndent())
                     val hasFirstSeen = columnExists(t, "first_seen")
-                    if (hasFirstSeen)
-                        exec("""INSERT INTO users_new(user_id, first_seen) SELECT user_id, first_seen FROM users;""")
-                    else
-                        exec("""INSERT INTO users_new(user_id, first_seen) SELECT user_id, 0 AS first_seen FROM users;""")
+                    val hasBlocked = columnExists(t, "blocked_ts")
+                    when {
+                        hasFirstSeen && hasBlocked ->
+                            exec(
+                                """
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
+                                    SELECT user_id, first_seen, blocked_ts FROM users;
+                                """.trimIndent()
+                            )
+                        hasFirstSeen && !hasBlocked ->
+                            exec(
+                                """
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
+                                    SELECT user_id, first_seen, 0 AS blocked_ts FROM users;
+                                """.trimIndent()
+                            )
+                        !hasFirstSeen && hasBlocked ->
+                            exec(
+                                """
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
+                                    SELECT user_id, 0 AS first_seen, blocked_ts FROM users;
+                                """.trimIndent()
+                            )
+                        else ->
+                            exec(
+                                """
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
+                                    SELECT user_id, 0 AS first_seen, 0 AS blocked_ts FROM users;
+                                """.trimIndent()
+                            )
+                    }
                     exec("""DROP TABLE users;""")
                     exec("""ALTER TABLE users_new RENAME TO users;""")
                     exec("""CREATE UNIQUE INDEX IF NOT EXISTS users_user_id ON users(user_id);""")
@@ -236,14 +265,60 @@ object DatabaseFactory {
                         );
                     """.trimIndent())
                     val hasTsOld = columnExists(t, "ts")
-                    if (hasTsOld)
-                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, ts, text, COALESCE(role, 'user') FROM messages;""")
-                    else
-                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, 0 AS ts, text, COALESCE(role, 'user') FROM messages;""")
+                    val hasTextOld = columnExists(t, "text")
+                    val hasContentOld = columnExists(t, "content")
+                    val tsExpr = if (hasTsOld) "COALESCE(ts, 0)" else "0"
+                    val textExpr = when {
+                        hasTextOld && hasContentOld -> "COALESCE(text, content, '')"
+                        hasTextOld -> "COALESCE(text, '')"
+                        hasContentOld -> "COALESCE(content, '')"
+                        else -> "''"
+                    }
+                    exec(
+                        """
+                            INSERT INTO messages_new(user_id, ts, text, role)
+                            SELECT user_id,
+                                   $tsExpr AS ts,
+                                   CASE WHEN TRIM($textExpr) = '' THEN '[legacy]' ELSE $textExpr END AS text,
+                                   COALESCE(role, 'user') AS role
+                            FROM messages;
+                        """.trimIndent()
+                    )
                     exec("""DROP TABLE messages;""")
                     exec("""ALTER TABLE messages_new RENAME TO messages;""")
                     exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
                 }
+            }
+
+            fun recreateMessagesIfHasContentColumn() {
+                val t = "messages"
+                if (!tableExists(t) || !columnExists(t, "content")) return
+                exec("""
+                    CREATE TABLE messages_new(
+                        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        ts      INTEGER NOT NULL,
+                        text    TEXT    NOT NULL,
+                        role    TEXT    NOT NULL DEFAULT 'user'
+                    );
+                """.trimIndent())
+                val hasTsOld = columnExists(t, "ts")
+                val hasTextOld = columnExists(t, "text")
+                val tsExpr = if (hasTsOld) "COALESCE(ts, 0)" else "0"
+                val textExpr = if (hasTextOld) "COALESCE(text, content, '')" else "COALESCE(content, '')"
+                exec(
+                    """
+                        INSERT INTO messages_new(user_id, ts, text, role)
+                        SELECT user_id,
+                               $tsExpr AS ts,
+                               CASE WHEN TRIM($textExpr) = '' THEN '[legacy]' ELSE $textExpr END AS text,
+                               COALESCE(role, 'user') AS role
+                        FROM messages;
+                    """.trimIndent()
+                )
+                exec("""DROP TABLE messages;""")
+                exec("""ALTER TABLE messages_new RENAME TO messages;""")
+                exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
             }
 
             fun recreateMemoryNotesIfNeeded() {
@@ -292,6 +367,7 @@ object DatabaseFactory {
             recreateIfNoPkUsers()
             recreateIfNoPkUserStats()
             recreateIfNoPkProcessedUpdates()
+            recreateMessagesIfHasContentColumn()
             recreateMessagesIfNeeded()
             recreateMemoryNotesIfNeeded()
             recreatePremiumRemindersIfNeeded()
@@ -303,6 +379,7 @@ object DatabaseFactory {
                 addColumnIfMissing("messages", "user_id INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("messages", "role TEXT NOT NULL DEFAULT 'user'")
                 exec("""UPDATE messages SET role = 'user' WHERE role IS NULL OR role = ''""")
+                exec("""UPDATE messages SET text = '[legacy]' WHERE text IS NULL OR TRIM(text) = ''""")
             }
             if (tableExists("memory_notes_v2")) {
                 addColumnIfMissing("memory_notes_v2", "ts INTEGER NOT NULL DEFAULT 0")
@@ -321,6 +398,7 @@ object DatabaseFactory {
             if (tableExists("users")) {
                 addColumnIfMissing("users", "first_seen INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "user_id INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("users", "blocked_ts INTEGER NOT NULL DEFAULT 0")
             }
             if (tableExists("user_stats")) {
                 addColumnIfMissing("user_stats", "day TEXT NOT NULL DEFAULT ''")

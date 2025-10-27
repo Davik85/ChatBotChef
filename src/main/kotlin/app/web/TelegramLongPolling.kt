@@ -4,7 +4,6 @@ import app.AppConfig
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
-import app.db.UsageCountersRepo
 import app.db.UsersRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
@@ -20,6 +19,7 @@ import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
 import app.web.dto.*
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import app.logic.RateLimiter
@@ -27,6 +27,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.ArrayDeque
+import kotlin.jvm.Volatile
+import kotlin.math.max
 
 class TelegramLongPolling(
     private val token: String,
@@ -37,6 +39,9 @@ class TelegramLongPolling(
     private val mode = mutableMapOf<Long, PersonaMode>()
     private val state = mutableMapOf<Long, BotState>()
     private val adminStates = mutableMapOf<Long, AdminState>()
+    @Volatile
+    private var broadcastJob: Job? = null
+    private val broadcastMutex = Any()
 
     private enum class PersonaMode { CHEF, CALC, PRODUCT }
     private enum class BotState { AWAITING_CALORIE_INPUT, AWAITING_PRODUCT_INPUT }
@@ -47,6 +52,8 @@ class TelegramLongPolling(
         object AwaitingUserIdForStatus : AdminState()
         object AwaitingGrantParams : AdminState()
     }
+
+    private enum class BroadcastResult { SENT, BLOCKED, FAILED }
 
     private companion object {
         private const val CB_RECIPES = "menu_recipes"
@@ -60,6 +67,10 @@ class TelegramLongPolling(
         private const val CB_ADMIN_USER_STATUS = "admin_user_status"
         private const val CB_ADMIN_GRANT = "admin_grant"
         private const val ADMIN_GRANT_USAGE = "Использование: <tgId> <days> (оба числа). Пример: 6859850730 30"
+        private const val MAX_BROADCAST_CHARS = 2000
+        private const val ACTIVITY_MAX_CHARS = 3800
+        private const val BROADCAST_RATE_DELAY_MS = 40L
+        private val NON_TEXT_REPLY = "Я работаю только с текстом: просто опиши, что хочешь приготовить ✍️"
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Я Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -153,6 +164,26 @@ class TelegramLongPolling(
         value = CTRL_REGEX.replace(value, "")
         if (value.length > AppConfig.HISTORY_MAX_CHARS_PER_MSG) {
             value = value.take(AppConfig.HISTORY_MAX_CHARS_PER_MSG)
+        }
+        return value.trim()
+    }
+
+    private fun sanitizeActivityText(raw: String): String? {
+        var value = raw.replace("\r", " ").replace("\n", " ")
+        value = CTRL_REGEX.replace(value, "")
+        value = value.trim()
+        if (value.isEmpty()) return null
+        if (value.length > ACTIVITY_MAX_CHARS) {
+            value = value.take(ACTIVITY_MAX_CHARS)
+        }
+        return value
+    }
+
+    private fun sanitizeAdminInput(raw: String, maxChars: Int = MAX_BROADCAST_CHARS): String {
+        var value = raw.replace("\r", " ").replace("\n", " ")
+        value = CTRL_REGEX.replace(value, "")
+        if (value.length > maxChars) {
+            value = value.take(maxChars)
         }
         return value.trim()
     }
@@ -423,11 +454,15 @@ class TelegramLongPolling(
             msg.sticker != null ||
             msg.animation != null
         if (hasAttachments) {
-            api.sendMessage(chatId, "Я принимаю только текстовые запросы. Пожалуйста, пришлите текст.")
+            api.sendMessage(chatId, NON_TEXT_REPLY)
             return
         }
 
         val originalText = msg.text ?: ""
+        if (originalText.isBlank()) {
+            api.sendMessage(chatId, NON_TEXT_REPLY)
+            return
+        }
         val text = originalText.trim()
         val lower = text.lowercase()
 
@@ -450,17 +485,17 @@ class TelegramLongPolling(
                             adminStates.remove(chatId)
                             api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
                         }
-                        originalText.isBlank() -> {
-                            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
-                        }
                         else -> {
-                            adminStates[chatId] = AdminState.AwaitingConfirmation(originalText)
-                            api.sendMessage(
-                                chatId,
-                                "Отправить рассылку всем пользователям?",
-                                replyMarkup = broadcastConfirmKeyboard(),
-                                parseMode = null
-                            )
+                            val prepared = validateBroadcastText(chatId, originalText)
+                            if (prepared != null) {
+                                adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
+                                api.sendMessage(
+                                    chatId,
+                                    "Отправить рассылку всем пользователям?\n\n$prepared",
+                                    replyMarkup = broadcastConfirmKeyboard(),
+                                    parseMode = null
+                                )
+                            }
                         }
                     }
                     return
@@ -471,17 +506,17 @@ class TelegramLongPolling(
                             adminStates.remove(chatId)
                             api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
                         }
-                        originalText.isBlank() -> {
-                            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
-                        }
                         else -> {
-                            adminStates[chatId] = AdminState.AwaitingConfirmation(originalText)
-                            api.sendMessage(
-                                chatId,
-                                "Отправить рассылку всем пользователям?",
-                                replyMarkup = broadcastConfirmKeyboard(),
-                                parseMode = null
-                            )
+                            val prepared = validateBroadcastText(chatId, originalText)
+                            if (prepared != null) {
+                                adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
+                                api.sendMessage(
+                                    chatId,
+                                    "Отправить рассылку всем пользователям?\n\n$prepared",
+                                    replyMarkup = broadcastConfirmKeyboard(),
+                                    parseMode = null
+                                )
+                            }
                         }
                     }
                     return
@@ -703,6 +738,28 @@ class TelegramLongPolling(
             )
         )
 
+    private fun validateBroadcastText(chatId: Long, rawInput: String): String? {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+            return null
+        }
+        if (trimmed.length > MAX_BROADCAST_CHARS) {
+            api.sendMessage(
+                chatId,
+                "Текст рассылки превышает ${MAX_BROADCAST_CHARS} символов. Сократите сообщение.",
+                parseMode = null
+            )
+            return null
+        }
+        val sanitized = sanitizeAdminInput(trimmed, MAX_BROADCAST_CHARS)
+        if (sanitized.isEmpty()) {
+            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+            return null
+        }
+        return sanitized
+    }
+
     private fun processAdminStatusInput(chatId: Long, adminId: Long, rawInput: String) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) {
@@ -715,13 +772,13 @@ class TelegramLongPolling(
             api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
             return
         }
-        val exists = runCatching { UsersRepo.exists(targetId) }
+        val info = runCatching { UsersRepo.find(targetId) }
             .onFailure { println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=${it.message}") }
             .getOrElse {
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                 return
             }
-        if (!exists) {
+        if (info == null) {
             println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=not_found")
             api.sendMessage(chatId, "Пользователь не найден.", parseMode = null)
             return
@@ -732,7 +789,8 @@ class TelegramLongPolling(
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                 return
             }
-        val used = runCatching { UsageCountersRepo.getTotalUsed(targetId) }
+        val since = System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L
+        val messages7d = runCatching { MessagesRepo.countUserMessagesSince(targetId, since) }
             .onFailure { println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=${it.message}") }
             .getOrElse {
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
@@ -741,15 +799,31 @@ class TelegramLongPolling(
         val now = System.currentTimeMillis()
         val premiumActive = until != null && until > now
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        val firstSeenDisplay = if (info.firstSeen > 0) dtf.format(Instant.ofEpochMilli(info.firstSeen)) else "—"
+        val blockedLine = if (info.blockedTs > 0) {
+            val blockedAt = dtf.format(Instant.ofEpochMilli(info.blockedTs))
+            "Статус: неактивен (ошибка доставки $blockedAt)"
+        } else {
+            "Статус: активен"
+        }
+        val premiumLine = if (premiumActive) {
+            "Премиум: активен до $untilDisplay"
+        } else {
+            "Премиум: не активен"
+        }
         val statusMessage = """
             Telegram ID: $targetId
-            Премиум: ${if (premiumActive) "активен" else "не активен"}
-            До: ${if (premiumActive) untilDisplay else "—"}
-            Бесплатных сообщений использовано: $used
+            Регистрация: $firstSeenDisplay
+            $blockedLine
+            $premiumLine
+            Сообщений за 7 дней: $messages7d
         """.trimIndent()
         api.sendMessage(chatId, statusMessage, parseMode = null)
         adminStates.remove(chatId)
-        println("ADMIN-STATUS: requester=$adminId target=$targetId premium=$premiumActive until=$untilDisplay used=$used")
+        println(
+            "ADMIN-STATUS: requester=$adminId target=$targetId premium=$premiumActive until=$untilDisplay " +
+                "messages7d=$messages7d blocked=${info.blockedTs}"
+        )
         showAdminMenu(chatId)
     }
 
@@ -795,18 +869,26 @@ class TelegramLongPolling(
     }
 
     private fun messageContentForLog(msg: TgMessage): String {
-        msg.text?.takeIf { it.isNotBlank() }?.let { return it }
-        return when {
-            msg.photo?.isNotEmpty() == true -> "[photo]"
-            msg.document != null -> "[document]"
-            msg.video != null -> "[video]"
-            msg.video_note != null -> "[video_note]"
-            msg.voice != null -> "[voice]"
-            msg.audio != null -> "[audio]"
-            msg.sticker != null -> "[sticker]"
-            msg.animation != null -> "[animation]"
-            else -> ""
+        val attachmentTag = when {
+            msg.photo?.isNotEmpty() == true -> "[non-text: photo]"
+            msg.document != null -> "[non-text: document]"
+            msg.video != null -> "[non-text: video]"
+            msg.video_note != null -> "[non-text: video_note]"
+            msg.voice != null -> "[non-text: voice]"
+            msg.audio != null -> "[non-text: audio]"
+            msg.sticker != null -> "[non-text: sticker]"
+            msg.animation != null -> "[non-text: animation]"
+            else -> null
         }
+        if (attachmentTag != null) {
+            val caption = msg.caption?.takeIf { it.isNotBlank() }
+                ?.let { sanitizeAdminInput(it, 200) }
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { " $it" }
+                ?: ""
+            return (attachmentTag + caption).trim()
+        }
+        return msg.text?.takeIf { it.isNotBlank() } ?: "[non-text]"
     }
 
     private fun trackUserActivity(userId: Long, text: String, role: String = "user") {
@@ -816,9 +898,10 @@ class TelegramLongPolling(
         if (registered) {
             println("USERS: registered user_id=$userId")
         }
-        runCatching { MessagesRepo.record(userId, text, role) }
+        val sanitized = sanitizeActivityText(text) ?: return
+        runCatching { MessagesRepo.record(userId, sanitized, role) }
             .onFailure {
-                val snippet = text.take(200).replace('\n', ' ')
+                val snippet = sanitized.take(200).replace('\n', ' ')
                 println("DB-ERR messages.record: user_id=$userId role=$role text=$snippet err=${it.message}")
             }
     }
@@ -850,62 +933,133 @@ class TelegramLongPolling(
 
     private fun startBroadcast(adminChatId: Long, text: String) {
         adminStates.remove(adminChatId)
-        api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
-        GlobalScope.launch {
-            val recipients = runCatching { UsersRepo.getAllUserIds() }
-                .onFailure {
-                    println("ADMIN-BROADCAST-ERR: failed to load users ${it.message}")
-                    api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
-                }
-                .getOrNull()
-                ?: return@launch
-
-            val messageChunks = splitMessageForBroadcast(text)
-            println("ADMIN-BROADCAST: start recipients=${recipients.size} chunks=${messageChunks.size}")
-            var attempts = 0
-            var success = 0
-            var errors = 0
-            for (recipient in recipients) {
-                for (chunk in messageChunks) {
-                    attempts++
-                    val sent = runCatching {
-                        api.sendMessage(recipient, chunk, parseMode = null, maxChars = 4096)
+        synchronized(broadcastMutex) {
+            val current = broadcastJob
+            if (current?.isActive == true) {
+                api.sendMessage(adminChatId, "Рассылка уже выполняется. Дождитесь завершения текущей отправки.", parseMode = null)
+                return
+            }
+            api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
+            broadcastJob = GlobalScope.launch {
+                try {
+                    val recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
+                        .onFailure {
+                            println("ADMIN-BROADCAST-ERR: failed to load users ${it.message}")
+                            api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
+                        }
+                        .getOrNull()
+                        ?: return@launch
+                    if (recipients.isEmpty()) {
+                        api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
+                        return@launch
                     }
-                    if (sent.getOrNull() != null) {
-                        success++
-                    } else {
-                        errors++
-                        val reason = sent.exceptionOrNull()?.message ?: "unknown"
-                        println("ADMIN-BROADCAST-ERR: user=$recipient chunk=${chunk.length} reason=$reason")
+                    val messageChunks = splitMessageForBroadcast(text)
+                    println("ADMIN-BROADCAST: start recipients=${recipients.size} chunks=${messageChunks.size}")
+                    var attempts = 0
+                    var success = 0
+                    var errors = 0
+                    var blocked = 0
+                    for (recipient in recipients) {
+                        for (chunk in messageChunks) {
+                            attempts++
+                            val result = sendBroadcastChunk(recipient, chunk)
+                            when (result) {
+                                BroadcastResult.SENT -> success++
+                                BroadcastResult.BLOCKED -> {
+                                    errors++
+                                    blocked++
+                                }
+                                BroadcastResult.FAILED -> errors++
+                            }
+                            delay(BROADCAST_RATE_DELAY_MS)
+                            if (result == BroadcastResult.BLOCKED) break
+                        }
                     }
-                    delay(35)
+                    val summary = buildString {
+                        appendLine("Рассылка завершена.")
+                        appendLine("Получателей: ${recipients.size}")
+                        appendLine("Сообщений отправлено: $success из $attempts.")
+                        append("Ошибок: $errors")
+                        if (blocked > 0) append(" (заблокировано: $blocked)")
+                    }.trimEnd()
+                    api.sendMessage(adminChatId, summary, parseMode = null)
+                    println("ADMIN-BROADCAST: done recipients=${recipients.size} attempts=$attempts success=$success errors=$errors blocked=$blocked")
+                } finally {
+                    synchronized(broadcastMutex) { broadcastJob = null }
                 }
             }
-            val summary = "Готово. Попыток: $attempts, отправлено: $success, ошибок: $errors."
-            api.sendMessage(adminChatId, summary, parseMode = null)
-            println("ADMIN-BROADCAST: done recipients=${recipients.size} attempts=$attempts success=$success errors=$errors")
         }
     }
 
+    private suspend fun sendBroadcastChunk(recipient: Long, chunk: String): BroadcastResult {
+        repeat(5) { attempt ->
+            val outcome = try {
+                api.sendMessageDetailed(recipient, chunk, parseMode = null, maxChars = 4096)
+            } catch (t: Throwable) {
+                println("ADMIN-BROADCAST-ERR: user=$recipient reason=${t.message}")
+                delay(500)
+                return@repeat
+            }
+            if (outcome.ok) {
+                return BroadcastResult.SENT
+            }
+            when (outcome.errorCode) {
+                429 -> {
+                    val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
+                    println("ADMIN-BROADCAST-RATE-LIMIT: user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
+                    delay(waitSec * 1000L + 250L)
+                    return@repeat
+                }
+                403 -> {
+                    val desc = outcome.description ?: "forbidden"
+                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=forbidden description=$desc")
+                    runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
+                        .onFailure { println("ADMIN-BROADCAST-ERR: mark_blocked_failed user=$recipient reason=${it.message}") }
+                    return BroadcastResult.BLOCKED
+                }
+                else -> {
+                    val code = outcome.errorCode?.toString() ?: "unknown"
+                    val desc = outcome.description ?: "unknown"
+                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=$desc code=$code")
+                    return BroadcastResult.FAILED
+                }
+            }
+        }
+        println("ADMIN-BROADCAST-ERR: user=$recipient reason=retries_exhausted")
+        return BroadcastResult.FAILED
+    }
+
+
     private fun sendAdminStats(chatId: Long) {
         val stats = runCatching {
-            val total = UsersRepo.countUsers()
+            val total = UsersRepo.countUsers(includeBlocked = true)
+            val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
+            val blocked = max(total - activeInstalls, 0L)
             val premium = PremiumRepo.countActive()
-            val active = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L)
-            Triple(total, premium, active)
+            val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L)
+            listOf(total, activeInstalls, blocked, premium, active7d)
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
-        println("ADMIN-STATS: total=${stats.first} premium=${stats.second} active7d=${stats.third}")
-        val msg = """
-            Статистика:
-            • Установок бота: ${stats.first}
-            • Премиум-пользователей: ${stats.second}
-            • Активно за 7 дней: ${stats.third}
-        """.trimIndent()
-        api.sendMessage(chatId, msg, parseMode = null)
+        val total = stats[0]
+        val activeInstalls = stats[1]
+        val blocked = stats[2]
+        val premium = stats[3]
+        val active7d = stats[4]
+        println("ADMIN-STATS: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
+        val message = buildString {
+            appendLine("Статистика:")
+            appendLine("• Установок бота: $total")
+            appendLine("• Активных установок: $activeInstalls")
+            appendLine("• Премиум-пользователей: $premium")
+            appendLine("• Активно за 7 дней: $active7d")
+            if (blocked > 0) {
+                appendLine("• Заблокировали бота: $blocked")
+            }
+        }.trimEnd()
+        api.sendMessage(chatId, message, parseMode = null)
     }
 
     private fun showAdminMenu(chatId: Long) {
