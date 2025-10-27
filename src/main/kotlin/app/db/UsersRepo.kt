@@ -9,6 +9,7 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.countDistinct
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -21,6 +22,13 @@ object UsersRepo {
         val userId: Long,
         val firstSeen: Long,
         val blockedTs: Long,
+    )
+
+    data class UserSnapshot(
+        val userId: Long,
+        val firstSeen: Long?,
+        val blockedTs: Long,
+        val existsInUsers: Boolean,
     )
 
     fun touch(userId: Long, now: Long = System.currentTimeMillis()): Boolean = transaction {
@@ -85,6 +93,33 @@ object UsersRepo {
                     blockedTs = it[Users.blocked_ts]
                 )
             }
+    }
+
+    fun loadSnapshot(userId: Long): UserSnapshot? = transaction {
+        Users
+            .select { Users.user_id eq userId }
+            .limit(1)
+            .firstOrNull()
+            ?.let {
+                return@transaction UserSnapshot(
+                    userId = it[Users.user_id],
+                    firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
+                    blockedTs = it[Users.blocked_ts],
+                    existsInUsers = true
+                )
+            }
+
+        val (hasPresence, resolvedTs) = resolveFirstSeenCandidate(userId)
+        if (!hasPresence) {
+            return@transaction null
+        }
+
+        UserSnapshot(
+            userId = userId,
+            firstSeen = resolvedTs?.takeIf { it > 0L },
+            blockedTs = 0L,
+            existsInUsers = false,
+        )
     }
 
     fun markBlocked(userId: Long, blocked: Boolean, now: Long = System.currentTimeMillis()): Boolean = transaction {
@@ -230,7 +265,11 @@ object UsersRepo {
         return result
     }
 
-    private fun Transaction.ensureUserInternal(userId: Long, resolvedTs: Long?, now: Long): EnsureResult {
+    private fun Transaction.ensureUserInternal(
+        userId: Long,
+        resolvedTs: Long?,
+        now: Long = System.currentTimeMillis(),
+    ): EnsureResult {
         if (userId <= 0) return EnsureResult(success = false, inserted = false)
         val firstSeenValue = resolvedTs?.takeIf { it > 0L } ?: now
         val insert = Users.insertIgnore {
