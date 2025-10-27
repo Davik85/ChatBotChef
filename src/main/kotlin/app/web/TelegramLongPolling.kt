@@ -1,6 +1,7 @@
 package app.web
 
 import app.AppConfig
+import app.db.AudienceRepo
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
@@ -80,7 +81,7 @@ class TelegramLongPolling(
         private const val MAX_BROADCAST_CHARS = 2000
         private const val ACTIVITY_MAX_CHARS = 3800
         private const val BROADCAST_RATE_DELAY_MS = 250L
-        private const val BROADCAST_BATCH_SIZE = 40
+        private const val BROADCAST_BATCH_SIZE = 500
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private val NON_TEXT_REPLY = "Я работаю только с текстом. Пришлите запрос текстом."
 
@@ -1155,41 +1156,36 @@ class TelegramLongPolling(
             api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
             broadcastJob = GlobalScope.launch {
                 try {
-                    var recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
+                    val context = runCatching { AudienceRepo.createContext(includeBlocked = false) }
                         .onFailure {
-                            println("ADMIN-BROADCAST-ERR: failed to load users ${it.message}")
+                            println("ADMIN-BROADCAST-ERR: failed to form audience ${it.message}")
                             api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
                         }
                         .getOrNull()
                         ?: return@launch
-                    if (recipients.isEmpty()) {
-                        runCatching { UserRegistry.backfillFromExistingData() }
-                            .onFailure { println("ADMIN-BROADCAST-ERR: users backfill failed ${it.message}") }
-                        recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
-                            .onFailure {
-                                println("ADMIN-BROADCAST-ERR: failed to load users after backfill ${it.message}")
-                                api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
-                            }
-                            .getOrNull()
-                            ?: return@launch
-                    }
-                    if (recipients.isEmpty()) {
+                    val totalRecipients = context.filteredCount
+                    if (totalRecipients <= 0L) {
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
                     }
                     val messageChunks = splitMessageForBroadcast(text)
-                    val totalRecipients = recipients.size
                     println(
                         "ADMIN-BROADCAST-START: admin=$adminChatId recipients=$totalRecipients chunks=${messageChunks.size}"
                     )
-                    var attempts = 0
-                    var sentRecipients = 0
-                    var failedRecipients = 0
-                    var blockedRecipients = 0
-                    var processed = 0
-                    recipients.chunked(BROADCAST_BATCH_SIZE).forEach { batch ->
+                    var attempts = 0L
+                    var sentRecipients = 0L
+                    var failedRecipients = 0L
+                    var blockedRecipients = 0L
+                    val totalBatches = ((totalRecipients + BROADCAST_BATCH_SIZE - 1) / BROADCAST_BATCH_SIZE).coerceAtLeast(1)
+                    var batchIndex = 0L
+                    var offset = 0L
+                    while (offset < totalRecipients) {
+                        val batch = AudienceRepo.loadPage(context, offset, BROADCAST_BATCH_SIZE)
+                        if (batch.isEmpty()) {
+                            break
+                        }
+                        batchIndex++
                         for (recipient in batch) {
-                            processed++
                             var recipientOutcome = BroadcastResult.SENT
                             for (chunk in messageChunks) {
                                 attempts++
@@ -1208,19 +1204,17 @@ class TelegramLongPolling(
                                 BroadcastResult.FAILED -> failedRecipients++
                             }
                         }
+                        offset += batch.size
+                        val failedTotal = failedRecipients + blockedRecipients
                         println(
-                            "ADMIN-BROADCAST-PROGRESS: admin=$adminChatId processed=$processed/$totalRecipients " +
-                                "attempts=$attempts sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
+                            "ADMIN-BROADCAST: batch=$batchIndex/$totalBatches sent=$sentRecipients failed=$failedTotal total=$totalRecipients"
                         )
                     }
-                    val summary = buildString {
-                        appendLine("Отправлено: $sentRecipients, Ошибок: $failedRecipients, Заблокировали: $blockedRecipients")
-                        append("Всего получателей: $totalRecipients")
-                    }
+                    val errors = failedRecipients + blockedRecipients
+                    val summary = "Отправлено: $sentRecipients, ошибок: $errors"
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     println(
-                        "ADMIN-BROADCAST-DONE: admin=$adminChatId recipients=$totalRecipients attempts=$attempts " +
-                            "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
+                        "ADMIN-BROADCAST-DONE: admin=$adminChatId recipients=$totalRecipients attempts=$attempts sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
                     )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
@@ -1261,6 +1255,10 @@ class TelegramLongPolling(
             if (outcome.ok) {
                 return BroadcastResult.SENT
             }
+            val code = outcome.errorCode?.toString() ?: "unknown"
+            val description = outcome.description?.replace("\n", " ")?.trim().orEmpty()
+            val body = if (description.isEmpty()) "unknown" else description
+            println("TG-HTTP-ERR sendMessage broadcast: code=$code body=$body user=$recipient")
             when {
                 outcome.errorCode == 429 -> {
                     val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
@@ -1290,11 +1288,12 @@ class TelegramLongPolling(
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
         val stats = runCatching {
-            val total = UsersRepo.countUsers(includeBlocked = true)
+            val audience = AudienceRepo.createContext(includeBlocked = false)
+            val total = audience.unionCount
             val blocked = UsersRepo.countBlocked()
             val premium = PremiumRepo.countActive()
             val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
-            val activeInstalls = (total - blocked).coerceAtLeast(0L)
+            val activeInstalls = audience.filteredCount.coerceAtLeast(0L)
             AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d)
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
@@ -1302,11 +1301,11 @@ class TelegramLongPolling(
             return
         }
         val total = stats.total.coerceAtLeast(0L)
-        val blocked = stats.blocked.coerceIn(0L, total)
-        val activeInstalls = (total - blocked).coerceAtLeast(0L)
+        val blocked = stats.blocked.coerceAtLeast(0L)
+        val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
         val premium = stats.premium.coerceAtLeast(0L)
         val active7d = stats.active7d.coerceAtLeast(0L)
-        println("ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
+        println("ADMIN-STATS-OK: total=$total premium=$premium active7d=$active7d blocked=$blocked")
         val message = buildString {
             appendLine("Статистика:")
             appendLine("• Установок бота: $total")
