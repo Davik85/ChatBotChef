@@ -2,6 +2,9 @@ package app.web
 
 import app.AppConfig
 import app.db.ChatHistoryRepo
+import app.db.MessagesRepo
+import app.db.PremiumRepo
+import app.db.UsersRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
 import app.logic.CalorieCalculatorPrompt
@@ -15,10 +18,9 @@ import app.web.dto.InlineKeyboardMarkup
 import app.web.dto.TgCallbackQuery
 import app.web.dto.TgUpdate
 import app.web.dto.*
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import app.db.PremiumRepo
 import app.logic.RateLimiter
 import java.time.Instant
 import java.time.ZoneId
@@ -33,15 +35,25 @@ class TelegramLongPolling(
 
     private val mode = mutableMapOf<Long, PersonaMode>()
     private val state = mutableMapOf<Long, BotState>()
+    private val adminStates = mutableMapOf<Long, AdminState>()
 
     private enum class PersonaMode { CHEF, CALC, PRODUCT }
     private enum class BotState { AWAITING_CALORIE_INPUT, AWAITING_PRODUCT_INPUT }
+
+    private sealed class AdminState {
+        object AwaitingBroadcastText : AdminState()
+        data class AwaitingConfirmation(val text: String) : AdminState()
+    }
 
     private companion object {
         private const val CB_RECIPES = "menu_recipes"
         private const val CB_CALC = "menu_calc"
         private const val CB_PRODUCT = "menu_product"
         private const val CB_HELP = "menu_help"
+        private const val CB_ADMIN_BROADCAST = "admin_broadcast"
+        private const val CB_ADMIN_STATS = "admin_stats"
+        private const val CB_ADMIN_CONFIRM = "admin_broadcast_confirm"
+        private const val CB_ADMIN_CANCEL = "admin_broadcast_cancel"
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Я Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -207,6 +219,7 @@ class TelegramLongPolling(
     // ===== Payments =====
 
     private fun handlePreCheckout(q: TgPreCheckoutQuery) {
+        trackUserActivity(q.from.id, "[pre_checkout] ${q.invoice_payload ?: ""}")
         val validation = PaymentService.validatePreCheckout(q)
         if (!validation.ok) {
             api.answerPreCheckoutQuery(q.id, ok = false, errorMessage = validation.errorMessage)
@@ -218,6 +231,9 @@ class TelegramLongPolling(
     private fun handleSuccessfulPayment(msg: TgMessage) {
         val chatId = msg.chat.id
         val payment = msg.successful_payment ?: return
+        val payerId = msg.from?.id ?: chatId
+        val paymentId = payment.provider_payment_charge_id ?: payment.telegram_payment_charge_id ?: ""
+        trackUserActivity(payerId, "[payment_success] $paymentId")
         val recorded = PaymentService.handleSuccessfulPayment(chatId, payment)
         if (!recorded) {
             api.sendMessage(chatId, "Мы получили уведомление об оплате, но не смогли подтвердить её автоматически. Поддержка уже уведомлена.")
@@ -272,6 +288,8 @@ class TelegramLongPolling(
         val msgId = cb.message.message_id
         val userId = cb.from.id
 
+        trackUserActivity(userId, "[callback] ${cb.data.orEmpty()}")
+
         when (cb.data) {
             CB_RECIPES -> {
                 api.answerCallback(cb.id)
@@ -306,6 +324,51 @@ class TelegramLongPolling(
                 if (!deleted) api.deleteInlineKeyboard(chatId, msgId)
                 api.sendMessage(chatId, HELP_TEXT)
             }
+            CB_ADMIN_BROADCAST -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                adminStates[chatId] = AdminState.AwaitingBroadcastText
+                api.sendMessage(chatId, "Пришлите текст рассылки одним сообщением.", parseMode = null)
+            }
+            CB_ADMIN_STATS -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                sendAdminStats(chatId)
+            }
+            CB_ADMIN_CONFIRM -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                val prepared = adminStates[chatId]
+                if (prepared is AdminState.AwaitingConfirmation) {
+                    api.deleteInlineKeyboard(chatId, msgId)
+                    startBroadcast(chatId, prepared.text)
+                } else {
+                    api.sendMessage(chatId, "Нет подготовленной рассылки.", parseMode = null)
+                }
+            }
+            CB_ADMIN_CANCEL -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                api.deleteInlineKeyboard(chatId, msgId)
+                if (adminStates.remove(chatId) != null) {
+                    api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
+                } else {
+                    api.sendMessage(chatId, "Нет подготовленной рассылки.", parseMode = null)
+                }
+            }
+            else -> api.answerCallback(cb.id)
         }
     }
 
@@ -315,6 +378,9 @@ class TelegramLongPolling(
         val chatId = msg.chat.id
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
+
+        val logContent = messageContentForLog(msg)
+        trackUserActivity(userId, logContent)
 
         val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
             msg.document != null ||
@@ -329,9 +395,71 @@ class TelegramLongPolling(
             return
         }
 
-        val text = msg.text?.trim().orEmpty()
-        if (text.isBlank()) return
+        val originalText = msg.text ?: ""
+        val text = originalText.trim()
         val lower = text.lowercase()
+
+        if (lower.startsWith("/admin")) {
+            if (!isAdmin(userId)) {
+                api.sendMessage(chatId, "Команда доступна только админам.")
+            } else {
+                showAdminMenu(chatId)
+            }
+            return
+        }
+
+        val adminState = adminStates[chatId]
+        if (isAdmin(userId)) {
+            when (adminState) {
+                AdminState.AwaitingBroadcastText -> {
+                    when {
+                        lower == "/cancel" -> {
+                            adminStates.remove(chatId)
+                            api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
+                        }
+                        originalText.isBlank() -> {
+                            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+                        }
+                        else -> {
+                            adminStates[chatId] = AdminState.AwaitingConfirmation(originalText)
+                            api.sendMessage(
+                                chatId,
+                                "Отправить рассылку всем пользователям?",
+                                replyMarkup = broadcastConfirmKeyboard(),
+                                parseMode = null
+                            )
+                        }
+                    }
+                    return
+                }
+                is AdminState.AwaitingConfirmation -> {
+                    when {
+                        lower == "/cancel" -> {
+                            adminStates.remove(chatId)
+                            api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
+                        }
+                        originalText.isBlank() -> {
+                            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+                        }
+                        else -> {
+                            adminStates[chatId] = AdminState.AwaitingConfirmation(originalText)
+                            api.sendMessage(
+                                chatId,
+                                "Отправить рассылку всем пользователям?",
+                                replyMarkup = broadcastConfirmKeyboard(),
+                                parseMode = null
+                            )
+                        }
+                    }
+                    return
+                }
+                null -> {}
+            }
+        } else if (adminState != null) {
+            adminStates.remove(chatId)
+        }
+
+        if (text.isBlank()) return
 
         // ADMIN
         if (lower.startsWith("/premiumstatus")) {
@@ -503,6 +631,135 @@ class TelegramLongPolling(
         state.remove(chatId)
     }
 
+
+    private fun adminMenuKeyboard(): InlineKeyboardMarkup =
+        InlineKeyboardMarkup(
+            inline_keyboard = listOf(
+                listOf(InlineKeyboardButton("Создать рассылку", CB_ADMIN_BROADCAST)),
+                listOf(InlineKeyboardButton("Статистика", CB_ADMIN_STATS))
+            )
+        )
+
+    private fun broadcastConfirmKeyboard(): InlineKeyboardMarkup =
+        InlineKeyboardMarkup(
+            inline_keyboard = listOf(
+                listOf(
+                    InlineKeyboardButton("Да", CB_ADMIN_CONFIRM),
+                    InlineKeyboardButton("Нет", CB_ADMIN_CANCEL)
+                )
+            )
+        )
+
+    private fun messageContentForLog(msg: TgMessage): String {
+        msg.text?.takeIf { it.isNotBlank() }?.let { return it }
+        return when {
+            msg.photo?.isNotEmpty() == true -> "[photo]"
+            msg.document != null -> "[document]"
+            msg.video != null -> "[video]"
+            msg.video_note != null -> "[video_note]"
+            msg.voice != null -> "[voice]"
+            msg.audio != null -> "[audio]"
+            msg.sticker != null -> "[sticker]"
+            msg.animation != null -> "[animation]"
+            else -> ""
+        }
+    }
+
+    private fun trackUserActivity(userId: Long, text: String) {
+        runCatching { UsersRepo.touch(userId) }
+            .onFailure { println("DB-ERR users.touch: ${it.message}") }
+        runCatching { MessagesRepo.record(userId, text) }
+            .onFailure { println("DB-ERR messages.record: ${it.message}") }
+    }
+
+    private fun splitMessageForBroadcast(text: String): List<String> {
+        val maxLen = 4096
+        if (text.length <= maxLen) return listOf(text)
+        val result = mutableListOf<String>()
+        var start = 0
+        while (start < text.length) {
+            var end = (start + maxLen).coerceAtMost(text.length)
+            if (end < text.length) {
+                var split = text.lastIndexOf('\n', end - 1)
+                if (split < start) {
+                    split = text.lastIndexOf(' ', end - 1)
+                }
+                if (split >= start) {
+                    end = split + 1
+                }
+            }
+            if (end <= start) {
+                end = (start + maxLen).coerceAtMost(text.length)
+            }
+            result += text.substring(start, end)
+            start = end
+        }
+        return result
+    }
+
+    private fun startBroadcast(adminChatId: Long, text: String) {
+        adminStates.remove(adminChatId)
+        api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
+        GlobalScope.launch {
+            val recipients = runCatching { UsersRepo.getAllUserIds() }
+                .onFailure {
+                    println("ADMIN-BROADCAST-ERR: failed to load users ${it.message}")
+                    api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
+                }
+                .getOrNull()
+                ?: return@launch
+
+            val messageChunks = splitMessageForBroadcast(text)
+            println("ADMIN-BROADCAST: start recipients=${recipients.size} chunks=${messageChunks.size}")
+            var attempts = 0
+            var success = 0
+            var errors = 0
+            for (recipient in recipients) {
+                for (chunk in messageChunks) {
+                    attempts++
+                    val sent = runCatching {
+                        api.sendMessage(recipient, chunk, parseMode = null, maxChars = 4096)
+                    }
+                    if (sent.getOrNull() != null) {
+                        success++
+                    } else {
+                        errors++
+                        val reason = sent.exceptionOrNull()?.message ?: "unknown"
+                        println("ADMIN-BROADCAST-ERR: user=$recipient chunk=${chunk.length} reason=$reason")
+                    }
+                    delay(35)
+                }
+            }
+            val summary = "Готово. Попыток: $attempts, отправлено: $success, ошибок: $errors."
+            api.sendMessage(adminChatId, summary, parseMode = null)
+            println("ADMIN-BROADCAST: done recipients=${recipients.size} attempts=$attempts success=$success errors=$errors")
+        }
+    }
+
+    private fun sendAdminStats(chatId: Long) {
+        val stats = runCatching {
+            val total = UsersRepo.countUsers()
+            val premium = PremiumRepo.countActive()
+            val active = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L)
+            Triple(total, premium, active)
+        }.getOrElse {
+            println("ADMIN-STATS-ERR: ${it.message}")
+            api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
+            return
+        }
+        val msg = """
+            Статистика:
+            • Установок бота: ${stats.first}
+            • Премиум-пользователей: ${stats.second}
+            • Активно за 7 дней: ${stats.third}
+        """.trimIndent()
+        api.sendMessage(chatId, msg, parseMode = null)
+    }
+
+    private fun showAdminMenu(chatId: Long) {
+        adminStates.remove(chatId)
+        api.sendMessage(chatId, "Админ-панель. Выберите действие:", replyMarkup = adminMenuKeyboard(), parseMode = null)
+    }
 
     private fun inlineMenu(): InlineKeyboardMarkup =
         InlineKeyboardMarkup(
