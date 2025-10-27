@@ -1,7 +1,6 @@
 package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.Transaction
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
@@ -22,6 +21,7 @@ object UsersRepo {
         val userId: Long,
         val firstSeen: Long,
         val blockedTs: Long,
+        val blocked: Boolean,
     )
 
     data class UserSnapshot(
@@ -29,6 +29,7 @@ object UsersRepo {
         val firstSeen: Long?,
         val blockedTs: Long,
         val existsInUsers: Boolean,
+        val blocked: Boolean,
     )
 
     fun touch(userId: Long, now: Long = System.currentTimeMillis()): Boolean = transaction {
@@ -36,6 +37,7 @@ object UsersRepo {
             it[Users.user_id] = userId
             it[Users.first_seen] = now
             it[Users.blocked_ts] = 0L
+            it[Users.blocked] = false
         }
         if (inserted.insertedCount > 0) return@transaction true
         val updatedFirstSeen = Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
@@ -43,6 +45,7 @@ object UsersRepo {
         } > 0
         Users.update({ Users.user_id eq userId }) {
             it[Users.blocked_ts] = 0L
+            it[Users.blocked] = false
         }
         updatedFirstSeen
     }
@@ -51,7 +54,7 @@ object UsersRepo {
         val query = if (includeBlocked) {
             Users.slice(Users.user_id).selectAll()
         } else {
-            Users.slice(Users.user_id).select { Users.blocked_ts eq 0L }
+            Users.slice(Users.user_id).select { Users.blocked eq false }
         }
         query.map { it[Users.user_id] }
     }
@@ -61,14 +64,14 @@ object UsersRepo {
         val query = if (includeBlocked) {
             Users.slice(distinctUsers).selectAll()
         } else {
-            Users.slice(distinctUsers).select { Users.blocked_ts eq 0L }
+            Users.slice(distinctUsers).select { Users.blocked eq false }
         }
         query.firstOrNull()?.get(distinctUsers)?.toLong() ?: 0L
     }
 
     fun countBlocked(): Long = transaction {
         Users
-            .select { Users.blocked_ts greater 0L }
+            .select { Users.blocked eq true }
             .count()
             .toLong()
     }
@@ -90,7 +93,8 @@ object UsersRepo {
                 UserInfo(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen],
-                    blockedTs = it[Users.blocked_ts]
+                    blockedTs = it[Users.blocked_ts],
+                    blocked = it[Users.blocked]
                 )
             }
     }
@@ -105,7 +109,8 @@ object UsersRepo {
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
                     blockedTs = it[Users.blocked_ts],
-                    existsInUsers = true
+                    existsInUsers = true,
+                    blocked = it[Users.blocked]
                 )
             }
 
@@ -119,6 +124,7 @@ object UsersRepo {
             firstSeen = resolvedTs?.takeIf { it > 0L },
             blockedTs = 0L,
             existsInUsers = false,
+            blocked = false,
         )
     }
 
@@ -126,6 +132,7 @@ object UsersRepo {
         val value = if (blocked) now else 0L
         Users.update({ Users.user_id eq userId }) { row ->
             row[Users.blocked_ts] = value
+            row[Users.blocked] = blocked
         } > 0
     }
 
@@ -276,6 +283,7 @@ object UsersRepo {
             it[Users.user_id] = userId
             it[Users.first_seen] = firstSeenValue
             it[Users.blocked_ts] = 0L
+            it[Users.blocked] = false
         }
         if (insert.insertedCount > 0) {
             return EnsureResult(success = true, inserted = true)
@@ -288,7 +296,8 @@ object UsersRepo {
             ?: return EnsureResult(success = false, inserted = false)
 
         val existingFirst = row[Users.first_seen]
-        val existingBlocked = row[Users.blocked_ts]
+        val existingBlockedTs = row[Users.blocked_ts]
+        val existingBlockedFlag = row[Users.blocked]
         val desiredFirst = when {
             resolvedTs != null && resolvedTs > 0L && existingFirst > 0L -> min(existingFirst, resolvedTs)
             resolvedTs != null && resolvedTs > 0L -> resolvedTs
@@ -296,11 +305,14 @@ object UsersRepo {
             else -> now
         }
         val needsFirstUpdate = desiredFirst != existingFirst
-        val needsBlockReset = existingBlocked > 0L
+        val needsBlockReset = existingBlockedTs > 0L || existingBlockedFlag
         if (needsFirstUpdate || needsBlockReset) {
             Users.update({ Users.user_id eq userId }) { update ->
                 if (needsFirstUpdate) update[Users.first_seen] = desiredFirst
-                if (needsBlockReset) update[Users.blocked_ts] = 0L
+                if (needsBlockReset) {
+                    update[Users.blocked_ts] = 0L
+                    update[Users.blocked] = false
+                }
             }
         }
         return EnsureResult(success = true, inserted = false)

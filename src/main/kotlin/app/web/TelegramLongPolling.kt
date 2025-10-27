@@ -55,6 +55,14 @@ class TelegramLongPolling(
 
     private enum class BroadcastResult { SENT, BLOCKED, FAILED }
 
+    private data class AdminStatsSnapshot(
+        val total: Long,
+        val activeInstalls: Long,
+        val blocked: Long,
+        val premium: Long,
+        val active7d: Long,
+    )
+
     private companion object {
         private const val CB_RECIPES = "menu_recipes"
         private const val CB_CALC = "menu_calc"
@@ -71,7 +79,7 @@ class TelegramLongPolling(
         private const val ADMIN_STATUS_COMMAND_USAGE = "Использование: /premiumstatus <tgId>"
         private const val MAX_BROADCAST_CHARS = 2000
         private const val ACTIVITY_MAX_CHARS = 3800
-        private const val BROADCAST_RATE_DELAY_MS = 40L
+        private const val BROADCAST_RATE_DELAY_MS = 250L
         private const val BROADCAST_BATCH_SIZE = 40
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private val NON_TEXT_REPLY = "Я работаю только с текстом. Пришлите запрос текстом."
@@ -1025,9 +1033,13 @@ class TelegramLongPolling(
         val premiumActive = until != null && until > now
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
         val firstSeenDisplay = snapshot.firstSeen?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
-        val blockedLine = if (snapshot.blockedTs > 0) {
-            val blockedAt = dtf.format(Instant.ofEpochMilli(snapshot.blockedTs))
-            "Статус: неактивен (ошибка доставки $blockedAt)"
+        val blockedLine = if (snapshot.blocked || snapshot.blockedTs > 0) {
+            val blockedAt = snapshot.blockedTs.takeIf { it > 0 }?.let { dtf.format(Instant.ofEpochMilli(it)) }
+            if (blockedAt != null) {
+                "Статус: неактивен (ошибка доставки $blockedAt)"
+            } else {
+                "Статус: неактивен"
+            }
         } else {
             "Статус: активен"
         }
@@ -1056,7 +1068,8 @@ class TelegramLongPolling(
         api.sendMessage(chatId, statusMessage, parseMode = null)
         println(
             "ADMIN-STATUS: requester=$adminId target=$targetId source=$source result=ok premium=$premiumActive " +
-                "until=$untilDisplay messages7d=$messages7d messagesTotal=$messagesTotal blocked=${snapshot.blockedTs} " +
+                "until=$untilDisplay messages7d=$messages7d messagesTotal=$messagesTotal blocked=${snapshot.blocked} " +
+                "blockedTs=${snapshot.blockedTs} " +
                 "existsInUsers=${snapshot.existsInUsers}"
         )
         if (showMenuAfter) {
@@ -1117,7 +1130,8 @@ class TelegramLongPolling(
                 )
             }
         println(
-            "ADMIN-GRANT: requester=$adminId target=$targetId days=$days source=$source result=ok until=$untilDisplay existsInUsers=${snapshot.existsInUsers}"
+            "ADMIN-GRANT: requester=$adminId target=$targetId days=$days source=$source result=ok until=$untilDisplay " +
+                "existsInUsers=${snapshot.existsInUsers} blocked=${snapshot.blocked} blockedTs=${snapshot.blockedTs}"
         )
         if (showMenuAfter) {
             showAdminMenu(chatId)
@@ -1183,44 +1197,48 @@ class TelegramLongPolling(
                     }
                     val messageChunks = splitMessageForBroadcast(text)
                     val totalRecipients = recipients.size
-                    println("ADMIN-BROADCAST: start recipients=$totalRecipients chunks=${messageChunks.size}")
+                    println(
+                        "ADMIN-BROADCAST-START: admin=$adminChatId recipients=$totalRecipients chunks=${messageChunks.size}"
+                    )
                     var attempts = 0
-                    var sent = 0
-                    var failed = 0
-                    var blocked = 0
+                    var sentRecipients = 0
+                    var failedRecipients = 0
+                    var blockedRecipients = 0
                     var processed = 0
                     recipients.chunked(BROADCAST_BATCH_SIZE).forEach { batch ->
                         for (recipient in batch) {
                             processed++
+                            var recipientOutcome = BroadcastResult.SENT
                             for (chunk in messageChunks) {
                                 attempts++
                                 val result = sendBroadcastChunk(recipient, chunk)
-                                when (result) {
-                                    BroadcastResult.SENT -> sent++
-                                    BroadcastResult.BLOCKED -> {
-                                        blocked++
-                                    }
-                                    BroadcastResult.FAILED -> {
-                                        failed++
-                                    }
+                                if (result != BroadcastResult.SENT) {
+                                    recipientOutcome = result
                                 }
                                 delay(BROADCAST_RATE_DELAY_MS)
                                 if (result != BroadcastResult.SENT) {
                                     break
                                 }
                             }
+                            when (recipientOutcome) {
+                                BroadcastResult.SENT -> sentRecipients++
+                                BroadcastResult.BLOCKED -> blockedRecipients++
+                                BroadcastResult.FAILED -> failedRecipients++
+                            }
                         }
                         println(
-                            "ADMIN-BROADCAST: progress processed=$processed/$totalRecipients attempts=$attempts sent=$sent failed=$failed blocked=$blocked"
+                            "ADMIN-BROADCAST-PROGRESS: admin=$adminChatId processed=$processed/$totalRecipients " +
+                                "attempts=$attempts sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
                         )
                     }
                     val summary = buildString {
-                        appendLine("Отправлено: $sent, Пропущено/ошибка: $failed, Заблокировали: $blocked")
+                        appendLine("Отправлено: $sentRecipients, Пропущено/ошибка: $failedRecipients, Заблокировали: $blockedRecipients")
                         append("Всего получателей: $totalRecipients")
                     }
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     println(
-                        "ADMIN-BROADCAST: done recipients=$totalRecipients attempts=$attempts sent=$sent failed=$failed blocked=$blocked"
+                        "ADMIN-BROADCAST-DONE: admin=$adminChatId recipients=$totalRecipients attempts=$attempts " +
+                            "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
                     )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
@@ -1229,26 +1247,45 @@ class TelegramLongPolling(
         }
     }
 
+    private fun isBlockedResponse(code: Int?, description: String?): Boolean {
+        if (code == 403) return true
+        val normalized = description?.lowercase()?.trim() ?: return false
+        return normalized.contains("bot was blocked by the user")
+    }
+
+    private fun isBlockedException(message: String?): Boolean {
+        if (message.isNullOrBlank()) return false
+        val normalized = message.lowercase()
+        if (normalized.contains("bot was blocked by the user")) return true
+        return normalized.contains("forbidden") && normalized.contains("403")
+    }
+
     private suspend fun sendBroadcastChunk(recipient: Long, chunk: String): BroadcastResult {
-        repeat(5) { attempt ->
+        for (attempt in 0 until 5) {
             val outcome = try {
                 api.sendMessageDetailed(recipient, chunk, parseMode = null, maxChars = 4096)
             } catch (t: Throwable) {
-                println("ADMIN-BROADCAST-ERR: user=$recipient reason=${t.message}")
+                val message = t.message
+                if (isBlockedException(message)) {
+                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=forbidden exception=${message ?: "unknown"}")
+                    runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
+                        .onFailure { println("ADMIN-BROADCAST-ERR: mark_blocked_failed user=$recipient reason=${it.message}") }
+                    return BroadcastResult.BLOCKED
+                }
+                println("ADMIN-BROADCAST-ERR: user=$recipient reason=${message ?: "unknown"} attempt=${attempt + 1}")
                 delay(500)
-                return@repeat
+                continue
             }
             if (outcome.ok) {
                 return BroadcastResult.SENT
             }
-            when (outcome.errorCode) {
-                429 -> {
+            when {
+                outcome.errorCode == 429 -> {
                     val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
                     println("ADMIN-BROADCAST-RATE-LIMIT: user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
                     delay(waitSec * 1000L + 250L)
-                    return@repeat
                 }
-                403 -> {
+                isBlockedResponse(outcome.errorCode, outcome.description) -> {
                     val desc = outcome.description ?: "forbidden"
                     println("ADMIN-BROADCAST-ERR: user=$recipient reason=forbidden description=$desc")
                     runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
@@ -1267,28 +1304,29 @@ class TelegramLongPolling(
         return BroadcastResult.FAILED
     }
 
-
     private fun sendAdminStats(chatId: Long) {
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
         val stats = runCatching {
             val total = UsersRepo.countUsers(includeBlocked = true)
+            val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
             val blocked = UsersRepo.countBlocked()
-            val activeInstalls = max(total - blocked, 0L)
             val premium = PremiumRepo.countActive()
-            val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L)
-            listOf(total, activeInstalls, blocked, premium, active7d)
+            val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
+            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d)
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
-        val total = stats[0]
-        val activeInstalls = stats[1]
-        val blocked = stats[2]
-        val premium = stats[3]
-        val active7d = stats[4]
-        println("ADMIN-STATS: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
+        val total = stats.total.coerceAtLeast(0L)
+        val blocked = stats.blocked.coerceIn(0L, total)
+        val normalizedActive = stats.activeInstalls.coerceIn(0L, total)
+        val fallbackActive = (total - blocked).coerceAtLeast(0L)
+        val activeInstalls = max(normalizedActive, fallbackActive).coerceAtMost(total)
+        val premium = stats.premium.coerceAtLeast(0L)
+        val active7d = stats.active7d.coerceAtLeast(0L)
+        println("ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
         val message = buildString {
             appendLine("Статистика:")
             appendLine("• Установок бота: $total")
