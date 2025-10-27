@@ -201,13 +201,15 @@ object UsersRepo {
         var earliest: Long? = null
         var hasFallbackPresence = false
 
+        val eqClause = "(user_id = $userId OR CAST(user_id AS TEXT) = '$userId')"
+
         fun considerMin(table: String, tsColumn: String) {
             if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, tsColumn)) return
             exec(
                 """
                     SELECT COUNT(*) AS total, MIN($tsColumn) AS first_seen
                     FROM $table
-                    WHERE user_id = $userId
+                    WHERE $eqClause
                 """.trimIndent()
             ) { rs ->
                 if (rs?.next() == true) {
@@ -231,7 +233,7 @@ object UsersRepo {
                 """
                     SELECT 1
                     FROM $table
-                    WHERE user_id = $userId
+                    WHERE $eqClause
                     LIMIT 1
                 """.trimIndent()
             ) { rs ->
