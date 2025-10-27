@@ -6,6 +6,7 @@ import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.countDistinct
 
 object MessagesRepo {
     private const val MAX_STORED_TEXT = 4000
@@ -38,12 +39,14 @@ object MessagesRepo {
     }
 
     fun countActiveSince(fromMs: Long): Long = transaction {
+        val countExpr = Messages.user_id.countDistinct()
         Messages
-            .slice(Messages.user_id)
+            .slice(countExpr)
             .select { (Messages.ts.greaterEq(fromMs)) and (Messages.role eq "user") }
-            .withDistinct()
-            .count()
-            .toLong()
+            .firstOrNull()
+            ?.get(countExpr)
+            ?.toLong()
+            ?: 0L
     }
 
     fun countUserMessagesSince(userId: Long, fromMs: Long): Long = transaction {
@@ -53,6 +56,13 @@ object MessagesRepo {
                     (Messages.ts.greaterEq(fromMs)) and
                     (Messages.role eq "user")
             }
+            .count()
+            .toLong()
+    }
+
+    fun countTotalUserMessages(userId: Long): Long = transaction {
+        Messages
+            .select { (Messages.user_id eq userId) and (Messages.role eq "user") }
             .count()
             .toLong()
     }
