@@ -12,6 +12,7 @@ object Users : Table(name = "users") {
     val user_id = long("user_id").uniqueIndex()
     val first_seen = long("first_seen")
     val blocked_ts = long("blocked_ts").default(0)
+    val blocked = bool("blocked").default(false)
     override val primaryKey = PrimaryKey(user_id)
 }
 
@@ -167,38 +168,52 @@ object DatabaseFactory {
                         CREATE TABLE users_new(
                             user_id    INTEGER PRIMARY KEY,
                             first_seen INTEGER NOT NULL,
-                            blocked_ts INTEGER NOT NULL DEFAULT 0
+                            blocked_ts INTEGER NOT NULL DEFAULT 0,
+                            blocked    INTEGER NOT NULL DEFAULT 0
                         );
                     """.trimIndent())
                     val hasFirstSeen = columnExists(t, "first_seen")
                     val hasBlocked = columnExists(t, "blocked_ts")
+                    val hasBlockedFlag = columnExists(t, "blocked")
                     when {
+                        hasFirstSeen && hasBlocked && hasBlockedFlag ->
+                            exec(
+                                """
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    SELECT user_id, first_seen, blocked_ts, blocked FROM users;
+                                """.trimIndent()
+                            )
                         hasFirstSeen && hasBlocked ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
-                                    SELECT user_id, first_seen, blocked_ts FROM users;
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    SELECT user_id,
+                                           first_seen,
+                                           blocked_ts,
+                                           CASE WHEN blocked_ts > 0 THEN 1 ELSE 0 END AS blocked
+                                    FROM users;
                                 """.trimIndent()
                             )
-                        hasFirstSeen && !hasBlocked ->
+                        hasFirstSeen && hasBlockedFlag ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
-                                    SELECT user_id, first_seen, 0 AS blocked_ts FROM users;
-                                """.trimIndent()
-                            )
-                        !hasFirstSeen && hasBlocked ->
-                            exec(
-                                """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
-                                    SELECT user_id, 0 AS first_seen, blocked_ts FROM users;
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    SELECT user_id, first_seen, 0 AS blocked_ts, blocked FROM users;
                                 """.trimIndent()
                             )
                         else ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts)
-                                    SELECT user_id, 0 AS first_seen, 0 AS blocked_ts FROM users;
+                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    SELECT user_id,
+                                           COALESCE(first_seen, 0) AS first_seen,
+                                           COALESCE(blocked_ts, 0) AS blocked_ts,
+                                           CASE
+                                               WHEN COALESCE(blocked_ts, 0) > 0 THEN 1
+                                               WHEN COALESCE(blocked, 0) != 0 THEN 1
+                                               ELSE 0
+                                           END AS blocked
+                                    FROM users;
                                 """.trimIndent()
                             )
                     }
@@ -399,6 +414,10 @@ object DatabaseFactory {
                 addColumnIfMissing("users", "first_seen INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "user_id INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "blocked_ts INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("users", "blocked INTEGER NOT NULL DEFAULT 0")
+                if (columnExists("users", "blocked") && columnExists("users", "blocked_ts")) {
+                    exec("""UPDATE users SET blocked = CASE WHEN blocked_ts > 0 THEN 1 ELSE 0 END""")
+                }
             }
             if (tableExists("user_stats")) {
                 addColumnIfMissing("user_stats", "day TEXT NOT NULL DEFAULT ''")
