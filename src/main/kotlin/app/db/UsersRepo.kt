@@ -9,6 +9,10 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.and
+import java.time.LocalDate
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import kotlin.math.min
 
 object UsersRepo {
 
@@ -100,134 +104,174 @@ object UsersRepo {
 
             if (!tableExists("users")) return@transaction 0L
 
-            fun run(sql: String) {
-                exec(sql)
+            val existingFirstSeen = Users
+                .slice(Users.user_id, Users.first_seen)
+                .selectAll()
+                .associate { it[Users.user_id] to it[Users.first_seen] }
+                .toMutableMap()
+
+            val candidates = mutableMapOf<Long, Long>()
+            fun registerCandidate(id: Long?, ts: Long?) {
+                if (id == null || id <= 0) return
+                val candidate = when {
+                    ts == null || ts <= 0L -> now
+                    else -> ts
+                }
+                val prev = candidates[id]
+                if (prev == null || candidate < prev) {
+                    candidates[id] = candidate
+                }
             }
 
-            val before = exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
-                var total = 0L
-                while (rs?.next() == true) total = rs.getLong("cnt")
-                total
-            } ?: 0L
-
-            val nowValue = now
+            fun registerBySql(sql: String, tsColumn: String?) {
+                exec(sql) { rs ->
+                    while (rs?.next() == true) {
+                        val userValue = rs.getLong("user_id")
+                        val userWasNull = rs.wasNull()
+                        if (userWasNull) continue
+                        val ts = if (tsColumn != null) {
+                            val value = rs.getLong(tsColumn)
+                            if (rs.wasNull()) null else value
+                        } else {
+                            null
+                        }
+                        registerCandidate(userValue, ts)
+                    }
+                }
+            }
 
             if (tableExists("messages")) {
-                run(
+                registerBySql(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               COALESCE(MIN(ts), $nowValue) AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, MIN(ts) AS first_seen
                         FROM messages
                         WHERE user_id IS NOT NULL AND user_id > 0
                         GROUP BY user_id;
-                    """.trimIndent()
+                    """.trimIndent(),
+                    tsColumn = "first_seen"
                 )
             }
 
             if (tableExists("chat_history")) {
-                run(
+                registerBySql(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               COALESCE(MIN(ts), $nowValue) AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, MIN(ts) AS first_seen
                         FROM chat_history
                         WHERE user_id IS NOT NULL AND user_id > 0
                         GROUP BY user_id;
-                    """.trimIndent()
+                    """.trimIndent(),
+                    tsColumn = "first_seen"
                 )
             }
 
             if (tableExists("memory_notes_v2")) {
-                run(
+                registerBySql(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               COALESCE(MIN(ts), $nowValue) AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, MIN(ts) AS first_seen
                         FROM memory_notes_v2
                         WHERE user_id IS NOT NULL AND user_id > 0
                         GROUP BY user_id;
-                    """.trimIndent()
-                )
-            }
-
-            if (tableExists("usage_counters")) {
-                run(
-                    """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               $nowValue AS first_seen,
-                               0 AS blocked_ts
-                        FROM usage_counters
-                        WHERE user_id IS NOT NULL AND user_id > 0;
-                    """.trimIndent()
-                )
-            }
-
-            if (tableExists("premium_users")) {
-                run(
-                    """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               $nowValue AS first_seen,
-                               0 AS blocked_ts
-                        FROM premium_users
-                        WHERE user_id IS NOT NULL AND user_id > 0;
-                    """.trimIndent()
+                    """.trimIndent(),
+                    tsColumn = "first_seen"
                 )
             }
 
             if (tableExists("premium_reminders")) {
-                run(
+                registerBySql(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               COALESCE(MIN(sent_ts), $nowValue) AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, MIN(sent_ts) AS first_seen
                         FROM premium_reminders
                         WHERE user_id IS NOT NULL AND user_id > 0
                         GROUP BY user_id;
-                    """.trimIndent()
+                    """.trimIndent(),
+                    tsColumn = "first_seen"
                 )
             }
 
             if (tableExists("payments")) {
-                run(
+                registerBySql(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               COALESCE(MIN(created_at), $nowValue) AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, MIN(created_at) AS first_seen
                         FROM payments
                         WHERE user_id IS NOT NULL AND user_id > 0
                         GROUP BY user_id;
-                    """.trimIndent()
+                    """.trimIndent(),
+                    tsColumn = "first_seen"
+                )
+            }
+
+            if (tableExists("usage_counters")) {
+                registerBySql(
+                    """
+                        SELECT user_id
+                        FROM usage_counters
+                        WHERE user_id IS NOT NULL AND user_id > 0;
+                    """.trimIndent(),
+                    tsColumn = null
+                )
+            }
+
+            if (tableExists("premium_users")) {
+                registerBySql(
+                    """
+                        SELECT user_id
+                        FROM premium_users
+                        WHERE user_id IS NOT NULL AND user_id > 0;
+                    """.trimIndent(),
+                    tsColumn = null
                 )
             }
 
             if (tableExists("user_stats")) {
-                run(
+                exec(
                     """
-                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
-                        SELECT user_id,
-                               $nowValue AS first_seen,
-                               0 AS blocked_ts
+                        SELECT user_id, day
                         FROM user_stats
-                        WHERE user_id IS NOT NULL AND user_id > 0;
+                        WHERE user_id IS NOT NULL AND user_id > 0 AND day IS NOT NULL AND TRIM(day) != '';
                     """.trimIndent()
-                )
+                ) { rs ->
+                    while (rs?.next() == true) {
+                        val userId = rs.getLong("user_id")
+                        if (rs.wasNull()) continue
+                        val dayRaw = rs.getString("day") ?: continue
+                        val parsedTs = runCatching {
+                            val date = LocalDate.parse(dayRaw.trim(), DateTimeFormatter.ISO_DATE)
+                            date.atStartOfDay().toInstant(ZoneOffset.UTC).toEpochMilli()
+                        }.getOrNull()
+                        registerCandidate(userId, parsedTs)
+                    }
+                }
             }
 
-            val after = exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
-                var total = before
-                while (rs?.next() == true) total = rs.getLong("cnt")
-                total
-            } ?: before
+            var insertedCount = 0L
 
-            (after - before).coerceAtLeast(0L)
+            candidates.forEach { (userId, firstSeenCandidate) ->
+                val sanitized = firstSeenCandidate.coerceAtLeast(0L)
+                val existing = existingFirstSeen[userId]
+                if (existing == null) {
+                    val result = Users.insertIgnore {
+                        it[Users.user_id] = userId
+                        it[Users.first_seen] = sanitized
+                        it[Users.blocked_ts] = 0L
+                    }
+                    if (result.insertedCount > 0) {
+                        insertedCount += result.insertedCount
+                        existingFirstSeen[userId] = sanitized
+                    }
+                } else {
+                    val effectiveExisting = if (existing > 0L) existing else Long.MAX_VALUE
+                    val desired = min(effectiveExisting, sanitized.takeIf { it > 0L } ?: now)
+                    if (desired < effectiveExisting || existing <= 0L) {
+                        Users.update({ Users.user_id eq userId }) { row ->
+                            row[Users.first_seen] = desired
+                            row[Users.blocked_ts] = 0L
+                        }
+                        existingFirstSeen[userId] = desired
+                    }
+                }
+            }
+
+            insertedCount
         }
 
         if (source != null && inserted > 0) {
