@@ -2,7 +2,6 @@ package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
-import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
@@ -39,14 +38,12 @@ object MessagesRepo {
     }
 
     fun countActiveSince(fromMs: Long): Long = transaction {
-        val distinctUsers = Messages.user_id.countDistinct()
         Messages
-            .slice(distinctUsers)
+            .slice(Messages.user_id)
             .select { (Messages.ts.greaterEq(fromMs)) and (Messages.role eq "user") }
-            .singleOrNull()
-            ?.get(distinctUsers)
-            ?.toLong()
-            ?: 0L
+            .withDistinct()
+            .count()
+            .toLong()
     }
 
     fun countUserMessagesSince(userId: Long, fromMs: Long): Long = transaction {
