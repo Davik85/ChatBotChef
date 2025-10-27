@@ -965,6 +965,25 @@ class TelegramLongPolling(
                 }
         }
         if (info == null) {
+            val repaired = runCatching { UsersRepo.repairUser(targetId, source = "admin_status_${source}") }
+                .onFailure {
+                    println(
+                        "ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=repair_single_failed err=${it.message}"
+                    )
+                }
+                .getOrElse { false }
+            if (repaired) {
+                info = runCatching { UsersRepo.find(targetId) }
+                    .onFailure {
+                        println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
+                    }
+                    .getOrElse {
+                        api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                        return false
+                    }
+            }
+        }
+        if (info == null) {
             println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=not_found")
             api.sendMessage(chatId, "Пользователь не найден. Он ещё ни разу не писал боту.", parseMode = null)
             return false
@@ -1061,6 +1080,25 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                     return false
                 }
+        }
+        if (!exists) {
+            val repaired = runCatching { UsersRepo.repairUser(targetId, source = "admin_grant_${source}") }
+                .onFailure {
+                    println(
+                        "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=repair_single_failed err=${it.message}"
+                    )
+                }
+                .getOrElse { false }
+            if (repaired) {
+                exists = runCatching { UsersRepo.exists(targetId) }
+                    .onFailure {
+                        println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
+                    }
+                    .getOrElse {
+                        api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                        return false
+                    }
+            }
         }
         if (!exists) {
             println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=not_found")
