@@ -302,6 +302,7 @@ object DatabaseFactory {
                     exec("""DROP TABLE messages;""")
                     exec("""ALTER TABLE messages_new RENAME TO messages;""")
                     exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
+                    exec("""CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);""")
                 }
             }
 
@@ -334,6 +335,7 @@ object DatabaseFactory {
                 exec("""DROP TABLE messages;""")
                 exec("""ALTER TABLE messages_new RENAME TO messages;""")
                 exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
+                exec("""CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);""")
             }
 
             fun recreateMemoryNotesIfNeeded() {
@@ -395,6 +397,7 @@ object DatabaseFactory {
                 addColumnIfMissing("messages", "role TEXT NOT NULL DEFAULT 'user'")
                 exec("""UPDATE messages SET role = 'user' WHERE role IS NULL OR role = ''""")
                 exec("""UPDATE messages SET text = '[legacy]' WHERE text IS NULL OR TRIM(text) = ''""")
+                exec("""CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);""")
             }
             if (tableExists("memory_notes_v2")) {
                 addColumnIfMissing("memory_notes_v2", "ts INTEGER NOT NULL DEFAULT 0")
