@@ -19,6 +19,7 @@ object Messages : Table(name = "messages") {
     val user_id = long("user_id").index()
     val ts = long("ts")
     val text = text("text")
+    val role = varchar("role", length = 16).default("user")
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -230,14 +231,15 @@ object DatabaseFactory {
                             id      INTEGER PRIMARY KEY AUTOINCREMENT,
                             user_id INTEGER NOT NULL,
                             ts      INTEGER NOT NULL,
-                            text    TEXT    NOT NULL
+                            text    TEXT    NOT NULL,
+                            role    TEXT    NOT NULL DEFAULT 'user'
                         );
                     """.trimIndent())
                     val hasTsOld = columnExists(t, "ts")
                     if (hasTsOld)
-                        exec("""INSERT INTO messages_new(user_id, ts, text) SELECT user_id, ts, text FROM messages;""")
+                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, ts, text, COALESCE(role, 'user') FROM messages;""")
                     else
-                        exec("""INSERT INTO messages_new(user_id, ts, text) SELECT user_id, 0 AS ts, text FROM messages;""")
+                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, 0 AS ts, text, COALESCE(role, 'user') FROM messages;""")
                     exec("""DROP TABLE messages;""")
                     exec("""ALTER TABLE messages_new RENAME TO messages;""")
                     exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
@@ -299,6 +301,8 @@ object DatabaseFactory {
                 addColumnIfMissing("messages", "ts INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("messages", "text TEXT NOT NULL DEFAULT ''")
                 addColumnIfMissing("messages", "user_id INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("messages", "role TEXT NOT NULL DEFAULT 'user'")
+                exec("""UPDATE messages SET role = 'user' WHERE role IS NULL OR role = ''""")
             }
             if (tableExists("memory_notes_v2")) {
                 addColumnIfMissing("memory_notes_v2", "ts INTEGER NOT NULL DEFAULT 0")
