@@ -2,6 +2,7 @@ package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
@@ -43,12 +44,13 @@ object UsersRepo {
     }
 
     fun countUsers(includeBlocked: Boolean = true): Long = transaction {
+        val distinctUsers = Users.user_id.countDistinct()
         val query = if (includeBlocked) {
-            Users.selectAll()
+            Users.slice(distinctUsers).selectAll()
         } else {
-            Users.select { Users.blocked_ts eq 0L }
+            Users.slice(distinctUsers).select { Users.blocked_ts eq 0L }
         }
-        query.count().toLong()
+        query.firstOrNull()?.get(distinctUsers)?.toLong() ?: 0L
     }
 
     fun countBlocked(): Long = transaction {
@@ -85,5 +87,153 @@ object UsersRepo {
         Users.update({ Users.user_id eq userId }) { row ->
             row[Users.blocked_ts] = value
         } > 0
+    }
+
+    fun repairOrphans(source: String? = null, now: Long = System.currentTimeMillis()): Long {
+        val inserted = transaction {
+            fun tableExists(name: String): Boolean =
+                exec("SELECT name FROM sqlite_master WHERE type='table' AND name='$name'") { rs ->
+                    var found = false
+                    while (rs?.next() == true) found = true
+                    found
+                } ?: false
+
+            if (!tableExists("users")) return@transaction 0L
+
+            fun run(sql: String) {
+                exec(sql)
+            }
+
+            val before = exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
+                var total = 0L
+                while (rs?.next() == true) total = rs.getLong("cnt")
+                total
+            } ?: 0L
+
+            val nowValue = now
+
+            if (tableExists("messages")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               COALESCE(MIN(ts), $nowValue) AS first_seen,
+                               0 AS blocked_ts
+                        FROM messages
+                        WHERE user_id IS NOT NULL AND user_id > 0
+                        GROUP BY user_id;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("chat_history")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               COALESCE(MIN(ts), $nowValue) AS first_seen,
+                               0 AS blocked_ts
+                        FROM chat_history
+                        WHERE user_id IS NOT NULL AND user_id > 0
+                        GROUP BY user_id;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("memory_notes_v2")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               COALESCE(MIN(ts), $nowValue) AS first_seen,
+                               0 AS blocked_ts
+                        FROM memory_notes_v2
+                        WHERE user_id IS NOT NULL AND user_id > 0
+                        GROUP BY user_id;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("usage_counters")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               $nowValue AS first_seen,
+                               0 AS blocked_ts
+                        FROM usage_counters
+                        WHERE user_id IS NOT NULL AND user_id > 0;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("premium_users")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               $nowValue AS first_seen,
+                               0 AS blocked_ts
+                        FROM premium_users
+                        WHERE user_id IS NOT NULL AND user_id > 0;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("premium_reminders")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               COALESCE(MIN(sent_ts), $nowValue) AS first_seen,
+                               0 AS blocked_ts
+                        FROM premium_reminders
+                        WHERE user_id IS NOT NULL AND user_id > 0
+                        GROUP BY user_id;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("payments")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               COALESCE(MIN(created_at), $nowValue) AS first_seen,
+                               0 AS blocked_ts
+                        FROM payments
+                        WHERE user_id IS NOT NULL AND user_id > 0
+                        GROUP BY user_id;
+                    """.trimIndent()
+                )
+            }
+
+            if (tableExists("user_stats")) {
+                run(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen, blocked_ts)
+                        SELECT user_id,
+                               $nowValue AS first_seen,
+                               0 AS blocked_ts
+                        FROM user_stats
+                        WHERE user_id IS NOT NULL AND user_id > 0;
+                    """.trimIndent()
+                )
+            }
+
+            val after = exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
+                var total = before
+                while (rs?.next() == true) total = rs.getLong("cnt")
+                total
+            } ?: before
+
+            (after - before).coerceAtLeast(0L)
+        }
+
+        if (source != null && inserted > 0) {
+            println("USERS: backfilled $inserted existing users source=$source")
+        }
+
+        return inserted
     }
 }

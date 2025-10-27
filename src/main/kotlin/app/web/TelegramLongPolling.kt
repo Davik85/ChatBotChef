@@ -939,7 +939,7 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
-        val info = runCatching { UsersRepo.find(targetId) }
+        var info = runCatching { UsersRepo.find(targetId) }
             .onFailure {
                 println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
             }
@@ -947,6 +947,23 @@ class TelegramLongPolling(
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                 return false
             }
+
+        if (info == null) {
+            runCatching { UsersRepo.repairOrphans(source = "admin_status") }
+                .onFailure {
+                    println(
+                        "ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=repair_failed err=${it.message}"
+                    )
+                }
+            info = runCatching { UsersRepo.find(targetId) }
+                .onFailure {
+                    println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
+                }
+                .getOrElse {
+                    api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                    return false
+                }
+        }
         if (info == null) {
             println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=not_found")
             api.sendMessage(chatId, "Пользователь не найден. Он ещё ни разу не писал боту.", parseMode = null)
@@ -1021,7 +1038,7 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
-        val exists = runCatching { UsersRepo.exists(targetId) }
+        var exists = runCatching { UsersRepo.exists(targetId) }
             .onFailure {
                 println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
             }
@@ -1029,6 +1046,22 @@ class TelegramLongPolling(
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                 return false
             }
+        if (!exists) {
+            runCatching { UsersRepo.repairOrphans(source = "admin_grant") }
+                .onFailure {
+                    println(
+                        "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=repair_failed err=${it.message}"
+                    )
+                }
+            exists = runCatching { UsersRepo.exists(targetId) }
+                .onFailure {
+                    println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
+                }
+                .getOrElse {
+                    api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                    return false
+                }
+        }
         if (!exists) {
             println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=not_found")
             api.sendMessage(chatId, "Пользователь не найден. Он ещё ни разу не писал боту.", parseMode = null)
@@ -1047,6 +1080,12 @@ class TelegramLongPolling(
 
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
         api.sendMessage(chatId, "Премиум пользователю $targetId активен до: $untilDisplay", parseMode = null)
+        runCatching { UsersRepo.touch(targetId) }
+            .onFailure {
+                println(
+                    "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=touch_failed err=${it.message}"
+                )
+            }
         println("ADMIN-GRANT: requester=$adminId target=$targetId days=$days until=$untilDisplay source=$source")
         if (showMenuAfter) {
             showAdminMenu(chatId)
@@ -1210,6 +1249,8 @@ class TelegramLongPolling(
 
 
     private fun sendAdminStats(chatId: Long) {
+        runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
+            .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
         val stats = runCatching {
             val total = UsersRepo.countUsers(includeBlocked = true)
             val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
