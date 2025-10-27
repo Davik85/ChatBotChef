@@ -49,12 +49,13 @@ object UsersRepo {
     }
 
     fun countUsers(includeBlocked: Boolean = true): Long = transaction {
+        val distinctUsers = Users.user_id.countDistinct()
         val query = if (includeBlocked) {
-            Users.selectAll()
+            Users.slice(distinctUsers).selectAll()
         } else {
-            Users.select { Users.blocked_ts eq 0L }
+            Users.slice(distinctUsers).select { Users.blocked_ts eq 0L }
         }
-        query.count().toLong()
+        query.firstOrNull()?.get(distinctUsers)?.toLong() ?: 0L
     }
 
     fun countBlocked(): Long = transaction {
