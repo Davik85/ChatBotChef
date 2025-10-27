@@ -4,6 +4,7 @@ import app.AppConfig
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
+import app.db.UsageCountersRepo
 import app.db.UsersRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
@@ -43,6 +44,8 @@ class TelegramLongPolling(
     private sealed class AdminState {
         object AwaitingBroadcastText : AdminState()
         data class AwaitingConfirmation(val text: String) : AdminState()
+        object AwaitingUserIdForStatus : AdminState()
+        object AwaitingGrantParams : AdminState()
     }
 
     private companion object {
@@ -54,6 +57,9 @@ class TelegramLongPolling(
         private const val CB_ADMIN_STATS = "admin_stats"
         private const val CB_ADMIN_CONFIRM = "admin_broadcast_confirm"
         private const val CB_ADMIN_CANCEL = "admin_broadcast_cancel"
+        private const val CB_ADMIN_USER_STATUS = "admin_user_status"
+        private const val CB_ADMIN_GRANT = "admin_grant"
+        private const val ADMIN_GRANT_USAGE = "Использование: <tgId> <days> (оба числа). Пример: 6859850730 30"
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Я Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -233,7 +239,7 @@ class TelegramLongPolling(
         val payment = msg.successful_payment ?: return
         val payerId = msg.from?.id ?: chatId
         val paymentId = payment.provider_payment_charge_id ?: payment.telegram_payment_charge_id ?: ""
-        trackUserActivity(payerId, "[payment_success] $paymentId")
+        trackUserActivity(payerId, "[payment_success] $paymentId", role = "system")
         val recorded = PaymentService.handleSuccessfulPayment(chatId, payment)
         if (!recorded) {
             api.sendMessage(chatId, "Мы получили уведомление об оплате, но не смогли подтвердить её автоматически. Поддержка уже уведомлена.")
@@ -330,6 +336,7 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
+                println("ADMIN: select broadcast chat=$chatId user=$userId")
                 adminStates[chatId] = AdminState.AwaitingBroadcastText
                 api.sendMessage(chatId, "Пришлите текст рассылки одним сообщением.", parseMode = null)
             }
@@ -339,7 +346,32 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
+                println("ADMIN: select stats chat=$chatId user=$userId")
                 sendAdminStats(chatId)
+            }
+            CB_ADMIN_USER_STATUS -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                println("ADMIN: select user_status chat=$chatId user=$userId")
+                adminStates[chatId] = AdminState.AwaitingUserIdForStatus
+                api.sendMessage(chatId, "Введите числовой Telegram ID пользователя.", parseMode = null)
+            }
+            CB_ADMIN_GRANT -> {
+                api.answerCallback(cb.id)
+                if (!isAdmin(userId)) {
+                    api.sendMessage(chatId, "Команда доступна только админам.")
+                    return
+                }
+                println("ADMIN: select grant chat=$chatId user=$userId")
+                adminStates[chatId] = AdminState.AwaitingGrantParams
+                api.sendMessage(
+                    chatId,
+                    "Введите данные в формате: <tgId> <days>. Пример: 6859850730 30",
+                    parseMode = null
+                )
             }
             CB_ADMIN_CONFIRM -> {
                 api.answerCallback(cb.id)
@@ -403,6 +435,7 @@ class TelegramLongPolling(
             if (!isAdmin(userId)) {
                 api.sendMessage(chatId, "Команда доступна только админам.")
             } else {
+                println("ADMIN: command /admin chat=$chatId user=$userId")
                 showAdminMenu(chatId)
             }
             return
@@ -450,6 +483,24 @@ class TelegramLongPolling(
                                 parseMode = null
                             )
                         }
+                    }
+                    return
+                }
+                AdminState.AwaitingUserIdForStatus -> {
+                    if (lower == "/cancel") {
+                        adminStates.remove(chatId)
+                        api.sendMessage(chatId, "Операция отменена.", parseMode = null)
+                    } else {
+                        processAdminStatusInput(chatId, userId, originalText)
+                    }
+                    return
+                }
+                AdminState.AwaitingGrantParams -> {
+                    if (lower == "/cancel") {
+                        adminStates.remove(chatId)
+                        api.sendMessage(chatId, "Операция отменена.", parseMode = null)
+                    } else {
+                        processAdminGrantInput(chatId, userId, originalText)
                     }
                     return
                 }
@@ -636,7 +687,9 @@ class TelegramLongPolling(
         InlineKeyboardMarkup(
             inline_keyboard = listOf(
                 listOf(InlineKeyboardButton("Создать рассылку", CB_ADMIN_BROADCAST)),
-                listOf(InlineKeyboardButton("Статистика", CB_ADMIN_STATS))
+                listOf(InlineKeyboardButton("Статистика", CB_ADMIN_STATS)),
+                listOf(InlineKeyboardButton("Проверить статус пользователя", CB_ADMIN_USER_STATUS)),
+                listOf(InlineKeyboardButton("Выдать премиум", CB_ADMIN_GRANT))
             )
         )
 
@@ -649,6 +702,97 @@ class TelegramLongPolling(
                 )
             )
         )
+
+    private fun processAdminStatusInput(chatId: Long, adminId: Long, rawInput: String) {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            api.sendMessage(chatId, "Введите числовой Telegram ID пользователя.", parseMode = null)
+            return
+        }
+        val targetId = trimmed.toLongOrNull()
+        if (targetId == null || targetId <= 0) {
+            println("ADMIN-STATUS-ERR: requester=$adminId raw=$trimmed reason=bad_id")
+            api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
+            return
+        }
+        val exists = runCatching { UsersRepo.exists(targetId) }
+            .onFailure { println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=${it.message}") }
+            .getOrElse {
+                api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                return
+            }
+        if (!exists) {
+            println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=not_found")
+            api.sendMessage(chatId, "Пользователь не найден.", parseMode = null)
+            return
+        }
+        val until = runCatching { PremiumRepo.getUntil(targetId) }
+            .onFailure { println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=${it.message}") }
+            .getOrElse {
+                api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                return
+            }
+        val used = runCatching { UsageCountersRepo.getTotalUsed(targetId) }
+            .onFailure { println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId reason=${it.message}") }
+            .getOrElse {
+                api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                return
+            }
+        val now = System.currentTimeMillis()
+        val premiumActive = until != null && until > now
+        val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        val statusMessage = """
+            Telegram ID: $targetId
+            Премиум: ${if (premiumActive) "активен" else "не активен"}
+            До: ${if (premiumActive) untilDisplay else "—"}
+            Бесплатных сообщений использовано: $used
+        """.trimIndent()
+        api.sendMessage(chatId, statusMessage, parseMode = null)
+        adminStates.remove(chatId)
+        println("ADMIN-STATUS: requester=$adminId target=$targetId premium=$premiumActive until=$untilDisplay used=$used")
+        showAdminMenu(chatId)
+    }
+
+    private fun processAdminGrantInput(chatId: Long, adminId: Long, rawInput: String) {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) {
+            api.sendMessage(chatId, ADMIN_GRANT_USAGE, parseMode = null)
+            return
+        }
+        val parts = trimmed.split("\\s+".toRegex(), limit = 3)
+        val targetId = parts.getOrNull(0)?.toLongOrNull()
+        val days = parts.getOrNull(1)?.toIntOrNull()
+        if (targetId == null || targetId <= 0 || days == null || days <= 0) {
+            println("ADMIN-GRANT-ERR: requester=$adminId raw=$trimmed reason=bad_input")
+            api.sendMessage(chatId, ADMIN_GRANT_USAGE, parseMode = null)
+            return
+        }
+        val exists = runCatching { UsersRepo.exists(targetId) }
+            .onFailure { println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days reason=${it.message}") }
+            .getOrElse {
+                api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                return
+            }
+        if (!exists) {
+            println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days reason=not_found")
+            api.sendMessage(chatId, "Пользователь не найден.", parseMode = null)
+            return
+        }
+        val until = runCatching {
+            PremiumRepo.grantDays(targetId, days)
+            PremiumRepo.getUntil(targetId)
+        }.onFailure {
+            println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days reason=${it.message}")
+        }.getOrElse {
+            api.sendMessage(chatId, "Не удалось выдать премиум. Проверьте логи.", parseMode = null)
+            return
+        }
+        val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        adminStates.remove(chatId)
+        api.sendMessage(chatId, "Премиум пользователю $targetId активен до: $untilDisplay", parseMode = null)
+        println("ADMIN-GRANT: requester=$adminId target=$targetId days=$days until=$untilDisplay")
+        showAdminMenu(chatId)
+    }
 
     private fun messageContentForLog(msg: TgMessage): String {
         msg.text?.takeIf { it.isNotBlank() }?.let { return it }
@@ -665,11 +809,18 @@ class TelegramLongPolling(
         }
     }
 
-    private fun trackUserActivity(userId: Long, text: String) {
-        runCatching { UsersRepo.touch(userId) }
+    private fun trackUserActivity(userId: Long, text: String, role: String = "user") {
+        val registered = runCatching { UsersRepo.touch(userId) }
             .onFailure { println("DB-ERR users.touch: ${it.message}") }
-        runCatching { MessagesRepo.record(userId, text) }
-            .onFailure { println("DB-ERR messages.record: ${it.message}") }
+            .getOrElse { false }
+        if (registered) {
+            println("USERS: registered user_id=$userId")
+        }
+        runCatching { MessagesRepo.record(userId, text, role) }
+            .onFailure {
+                val snippet = text.take(200).replace('\n', ' ')
+                println("DB-ERR messages.record: user_id=$userId role=$role text=$snippet err=${it.message}")
+            }
     }
 
     private fun splitMessageForBroadcast(text: String): List<String> {
@@ -747,6 +898,7 @@ class TelegramLongPolling(
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
+        println("ADMIN-STATS: total=${stats.first} premium=${stats.second} active7d=${stats.third}")
         val msg = """
             Статистика:
             • Установок бота: ${stats.first}
@@ -758,6 +910,7 @@ class TelegramLongPolling(
 
     private fun showAdminMenu(chatId: Long) {
         adminStates.remove(chatId)
+        println("ADMIN: show_menu chat=$chatId")
         api.sendMessage(chatId, "Админ-панель. Выберите действие:", replyMarkup = adminMenuKeyboard(), parseMode = null)
     }
 

@@ -19,6 +19,7 @@ object Messages : Table(name = "messages") {
     val user_id = long("user_id").index()
     val ts = long("ts")
     val text = text("text")
+    val role = varchar("role", length = 16).default("user")
     override val primaryKey = PrimaryKey(id)
 }
 
@@ -230,14 +231,15 @@ object DatabaseFactory {
                             id      INTEGER PRIMARY KEY AUTOINCREMENT,
                             user_id INTEGER NOT NULL,
                             ts      INTEGER NOT NULL,
-                            text    TEXT    NOT NULL
+                            text    TEXT    NOT NULL,
+                            role    TEXT    NOT NULL DEFAULT 'user'
                         );
                     """.trimIndent())
                     val hasTsOld = columnExists(t, "ts")
                     if (hasTsOld)
-                        exec("""INSERT INTO messages_new(user_id, ts, text) SELECT user_id, ts, text FROM messages;""")
+                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, ts, text, COALESCE(role, 'user') FROM messages;""")
                     else
-                        exec("""INSERT INTO messages_new(user_id, ts, text) SELECT user_id, 0 AS ts, text FROM messages;""")
+                        exec("""INSERT INTO messages_new(user_id, ts, text, role) SELECT user_id, 0 AS ts, text, COALESCE(role, 'user') FROM messages;""")
                     exec("""DROP TABLE messages;""")
                     exec("""ALTER TABLE messages_new RENAME TO messages;""")
                     exec("""CREATE INDEX IF NOT EXISTS messages_user_id ON messages(user_id);""")
@@ -299,6 +301,8 @@ object DatabaseFactory {
                 addColumnIfMissing("messages", "ts INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("messages", "text TEXT NOT NULL DEFAULT ''")
                 addColumnIfMissing("messages", "user_id INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("messages", "role TEXT NOT NULL DEFAULT 'user'")
+                exec("""UPDATE messages SET role = 'user' WHERE role IS NULL OR role = ''""")
             }
             if (tableExists("memory_notes_v2")) {
                 addColumnIfMissing("memory_notes_v2", "ts INTEGER NOT NULL DEFAULT 0")
@@ -353,6 +357,81 @@ object DatabaseFactory {
                 Users, Messages, MemoryNotesV2, UserStats, ProcessedUpdates,
                 PremiumUsers, PremiumReminders, Payments, UsageCounters, ChatHistory
             )
+        }
+
+        transaction {
+            fun tableExists(name: String): Boolean =
+                exec("SELECT name FROM sqlite_master WHERE type='table' AND name='$name'") { rs ->
+                    var found = false
+                    while (rs?.next() == true) found = true
+                    found
+                } ?: false
+
+            fun columnExists(table: String, column: String): Boolean =
+                exec("PRAGMA table_info($table)") { rs ->
+                    var ok = false
+                    while (rs?.next() == true) {
+                        if (rs.getString("name") == column) { ok = true; break }
+                    }
+                    ok
+                } ?: false
+
+            fun countUsers(): Long =
+                exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
+                    var total = 0L
+                    while (rs?.next() == true) total = rs.getLong("cnt")
+                    total
+                } ?: 0L
+
+            val before = if (tableExists("users")) countUsers() else 0L
+
+            fun backfillUsersFrom(
+                table: String,
+                userColumn: String,
+                tsColumn: String? = null
+            ) {
+                if (!tableExists("users") || !tableExists(table) || !columnExists(table, userColumn)) return
+
+                val hasTs = tsColumn != null && columnExists(table, tsColumn)
+                val selectSql = if (hasTs) {
+                    """
+                        SELECT $userColumn AS user_id, MIN($tsColumn) AS first_seen
+                        FROM $table
+                        WHERE $userColumn IS NOT NULL
+                        GROUP BY $userColumn
+                    """.trimIndent()
+                } else {
+                    """
+                        SELECT DISTINCT $userColumn AS user_id, 0 AS first_seen
+                        FROM $table
+                        WHERE $userColumn IS NOT NULL
+                    """.trimIndent()
+                }
+
+                exec(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen)
+                        $selectSql;
+                    """.trimIndent()
+                )
+            }
+
+            backfillUsersFrom("messages", "user_id", "ts")
+            backfillUsersFrom("chat_history", "user_id", "ts")
+            backfillUsersFrom("memory_notes_v2", "user_id", "ts")
+            backfillUsersFrom("usage_counters", "user_id")
+            backfillUsersFrom("premium_users", "user_id")
+            backfillUsersFrom("premium_reminders", "user_id")
+            backfillUsersFrom("payments", "user_id", "created_at")
+            backfillUsersFrom("user_stats", "user_id")
+
+            if (tableExists("users")) {
+                val after = countUsers()
+                val delta = after - before
+                if (delta > 0) {
+                    println("USERS: backfilled $delta existing users")
+                }
+            }
         }
     }
 }
