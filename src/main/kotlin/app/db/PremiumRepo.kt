@@ -2,6 +2,7 @@ package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.between
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
@@ -68,5 +69,11 @@ object PremiumRepo {
                     cb(row[PremiumUsers.user_id], row[PremiumUsers.until_ts])
                 }
         }
+    }
+
+    fun countActive(now: Long = System.currentTimeMillis()): Long = transaction {
+        PremiumUsers
+            .select { PremiumUsers.until_ts.greater(now) }
+            .count()
     }
 }
