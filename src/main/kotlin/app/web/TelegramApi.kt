@@ -46,7 +46,14 @@ class TelegramApi(private val token: String) {
     fun getUpdates(offset: Long?): List<TgUpdate> {
         val args = mutableMapOf<String, Any>(
             "timeout" to 25,
-            "allowed_updates" to listOf("message", "edited_message", "callback_query", "pre_checkout_query")
+            "allowed_updates" to listOf(
+                "message",
+                "edited_message",
+                "callback_query",
+                "pre_checkout_query",
+                "my_chat_member",
+                "chat_member"
+            )
         )
         if (offset != null) args["offset"] = offset
         val body = mapper.writeValueAsString(args).toRequestBody(json)

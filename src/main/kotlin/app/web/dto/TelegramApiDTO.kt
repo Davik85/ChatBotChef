@@ -197,5 +197,24 @@ data class TgUpdate(
     val callback_query: TgCallbackQuery? = null,
 
     // Telegram Payments
-    val pre_checkout_query: TgPreCheckoutQuery? = null
+    val pre_checkout_query: TgPreCheckoutQuery? = null,
+
+    // изменения статуса чата/бота
+    val my_chat_member: TgChatMemberUpdated? = null,
+    val chat_member: TgChatMemberUpdated? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgChatMember(
+    val status: String? = null,
+    val user: TgUser? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgChatMemberUpdated(
+    val chat: TgChat,
+    val from: TgUser? = null,
+    val date: Long? = null,
+    val old_chat_member: TgChatMember? = null,
+    val new_chat_member: TgChatMember? = null
 )
