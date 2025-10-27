@@ -72,6 +72,7 @@ class TelegramLongPolling(
         private const val MAX_BROADCAST_CHARS = 2000
         private const val ACTIVITY_MAX_CHARS = 3800
         private const val BROADCAST_RATE_DELAY_MS = 40L
+        private const val BROADCAST_BATCH_SIZE = 40
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private val NON_TEXT_REPLY = "Я работаю только с текстом. Пришлите запрос текстом."
 
@@ -189,6 +190,21 @@ class TelegramLongPolling(
             value = value.take(maxChars)
         }
         return value.trim()
+    }
+
+    private fun parseTelegramId(raw: String?): Long? {
+        if (raw.isNullOrBlank()) return null
+        val normalized = raw.trim().removePrefix("+").replace("\\s+".toRegex(), "")
+        if (normalized.isEmpty()) return null
+        if (normalized.any { !it.isDigit() }) return null
+        return normalized.toLongOrNull()
+    }
+
+    private fun parsePositiveDays(raw: String?): Int? {
+        if (raw.isNullOrBlank()) return null
+        val normalized = raw.trim()
+        val value = normalized.toIntOrNull() ?: return null
+        return value.takeIf { it > 0 }
     }
 
     private fun buildHistoryMessages(userId: Long, personaMode: PersonaMode): List<ChatMessage> {
@@ -375,6 +391,7 @@ class TelegramLongPolling(
         val msgId = cb.message.message_id
         val userId = cb.from.id
 
+        registerUser(userId, "callback")
         trackUserActivity(userId, "[callback] ${cb.data.orEmpty()}")
 
         when (cb.data) {
@@ -492,8 +509,7 @@ class TelegramLongPolling(
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
 
-        val logContent = messageContentForLog(msg)
-        trackUserActivity(userId, logContent)
+        registerUser(userId, "message_route")
 
         val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
             msg.document != null ||
@@ -515,6 +531,8 @@ class TelegramLongPolling(
         }
         val text = originalText.trim()
         val lower = text.lowercase()
+
+        trackUserActivity(userId, originalText)
 
         if (lower.startsWith("/admin")) {
             if (!isAdmin(userId)) {
@@ -672,12 +690,9 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Введите числовой Telegram ID пользователя.", parseMode = null)
                     true
                 } else {
-                    val targetId = trimmed.toLongOrNull()
+                    val targetId = parseTelegramId(trimmed)
                     if (targetId == null) {
-                        println("ADMIN-STATUS-ERR: requester=$adminId raw=$trimmed reason=bad_input source=panel_exit")
-                        false
-                    } else if (targetId <= 0) {
-                        println("ADMIN-STATUS-ERR: requester=$adminId raw=$trimmed reason=bad_id source=panel")
+                        println("ADMIN-STATUS: requester=$adminId raw=$trimmed source=panel result=bad_id")
                         api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
                         true
                     } else {
@@ -708,40 +723,43 @@ class TelegramLongPolling(
                     true
                 } else {
                     val parts = trimmed.split("\\s+".toRegex(), limit = 3)
-                    val targetId = parts.getOrNull(0)?.toLongOrNull()
-                    val days = parts.getOrNull(1)?.toIntOrNull()
                     val targetToken = parts.getOrNull(0)
                     val daysToken = parts.getOrNull(1)
-                    if (targetToken == null || daysToken == null) {
-                        val looksNumeric = targetToken?.all { it.isDigit() } == true
-                        if (looksNumeric) {
-                            println("ADMIN-GRANT-ERR: requester=$adminId raw=$trimmed reason=missing_days source=panel")
-                            api.sendMessage(chatId, ADMIN_GRANT_USAGE, parseMode = null)
-                            true
-                        } else {
-                            println("ADMIN-GRANT-ERR: requester=$adminId raw=$trimmed reason=bad_input source=panel_exit")
-                            false
-                        }
-                    } else if (targetId == null || days == null) {
-                        println("ADMIN-GRANT-ERR: requester=$adminId raw=$trimmed reason=bad_input source=panel_exit")
-                        false
-                    } else if (targetId <= 0 || days <= 0) {
-                        println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days reason=bad_input source=panel")
+                    if (targetToken.isNullOrBlank() || daysToken.isNullOrBlank()) {
+                        println("ADMIN-GRANT: requester=$adminId raw=$trimmed source=panel result=missing_args")
                         api.sendMessage(chatId, ADMIN_GRANT_USAGE, parseMode = null)
                         true
                     } else {
-                        val handled = handleGrantPremium(
-                            chatId = chatId,
-                            adminId = adminId,
-                            targetId = targetId,
-                            days = days,
-                            source = "panel",
-                            showMenuAfter = true
-                        )
-                        if (handled) {
-                            adminStates.remove(chatId)
+                        val targetId = parseTelegramId(targetToken)
+                        val days = parsePositiveDays(daysToken)
+                        if (targetId == null) {
+                            println("ADMIN-GRANT: requester=$adminId raw=$trimmed source=panel result=bad_id")
+                            api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
+                            true
+                        } else if (days == null) {
+                            val isNumeric = daysToken.trim().toIntOrNull() != null
+                            if (isNumeric) {
+                                println("ADMIN-GRANT: requester=$adminId target=$targetId raw=$trimmed source=panel result=bad_days")
+                                api.sendMessage(chatId, "Количество дней должно быть больше 0.", parseMode = null)
+                            } else {
+                                println("ADMIN-GRANT: requester=$adminId raw=$trimmed source=panel result=bad_days_format")
+                                api.sendMessage(chatId, ADMIN_GRANT_USAGE, parseMode = null)
+                            }
+                            true
+                        } else {
+                            val handled = handleGrantPremium(
+                                chatId = chatId,
+                                adminId = adminId,
+                                targetId = targetId,
+                                days = days,
+                                source = "panel",
+                                showMenuAfter = true,
+                            )
+                            if (handled) {
+                                adminStates.remove(chatId)
+                            }
+                            true
                         }
-                        true
                     }
                 }
             }
@@ -762,13 +780,13 @@ class TelegramLongPolling(
             val targetIdRaw = parts.getOrNull(1)
             if (targetIdRaw.isNullOrBlank()) {
                 api.sendMessage(chatId, ADMIN_STATUS_COMMAND_USAGE, parseMode = null)
-                println("ADMIN-STATUS-ERR: requester=$userId raw=$trimmed reason=no_args source=command")
+                println("ADMIN-STATUS: requester=$userId raw=$trimmed source=command result=missing_args")
                 return true
             }
-            val targetId = targetIdRaw.toLongOrNull()
-            if (targetId == null || targetId <= 0) {
+            val targetId = parseTelegramId(targetIdRaw)
+            if (targetId == null) {
                 api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
-                println("ADMIN-STATUS-ERR: requester=$userId raw=$trimmed reason=bad_id source=command")
+                println("ADMIN-STATUS: requester=$userId raw=$trimmed source=command result=bad_id")
                 return true
             }
             handlePremiumStatusLookup(
@@ -787,11 +805,23 @@ class TelegramLongPolling(
                 return true
             }
             val parts = trimmed.split("\\s+".toRegex(), limit = 3)
-            val targetId = parts.getOrNull(1)?.toLongOrNull()
-            val days = parts.getOrNull(2)?.toIntOrNull()
-            if (targetId == null || targetId <= 0 || days == null || days <= 0) {
-                api.sendMessage(chatId, ADMIN_GRANT_COMMAND_USAGE, parseMode = null)
-                println("ADMIN-GRANT-ERR: requester=$userId raw=$trimmed reason=bad_input source=command")
+            val targetId = parseTelegramId(parts.getOrNull(1))
+            val daysRaw = parts.getOrNull(2)
+            val days = parsePositiveDays(daysRaw)
+            if (targetId == null) {
+                api.sendMessage(chatId, "Неверный ID. Введите числовой Telegram ID.", parseMode = null)
+                println("ADMIN-GRANT: requester=$userId raw=$trimmed source=command result=bad_id")
+                return true
+            }
+            if (days == null) {
+                val numeric = daysRaw?.trim()?.toIntOrNull() != null
+                if (numeric) {
+                    api.sendMessage(chatId, "Количество дней должно быть больше 0.", parseMode = null)
+                    println("ADMIN-GRANT: requester=$userId target=$targetId raw=$trimmed source=command result=bad_days")
+                } else {
+                    api.sendMessage(chatId, ADMIN_GRANT_COMMAND_USAGE, parseMode = null)
+                    println("ADMIN-GRANT: requester=$userId raw=$trimmed source=command result=missing_days")
+                }
                 return true
             }
             handleGrantPremium(
@@ -939,7 +969,7 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
-        var info = runCatching { UsersRepo.find(targetId) }
+        val snapshot = runCatching { UsersRepo.loadSnapshot(targetId) }
             .onFailure {
                 println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
             }
@@ -948,45 +978,20 @@ class TelegramLongPolling(
                 return false
             }
 
-        if (info == null) {
-            runCatching { UsersRepo.repairOrphans(source = "admin_status") }
-                .onFailure {
-                    println(
-                        "ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=repair_failed err=${it.message}"
-                    )
-                }
-            info = runCatching { UsersRepo.find(targetId) }
-                .onFailure {
-                    println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
-                }
-                .getOrElse {
-                    api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
-                    return false
-                }
-        }
-        if (info == null) {
-            val repaired = runCatching { UsersRepo.repairUser(targetId, source = "admin_status_${source}") }
-                .onFailure {
-                    println(
-                        "ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=repair_single_failed err=${it.message}"
-                    )
-                }
-                .getOrElse { false }
-            if (repaired) {
-                info = runCatching { UsersRepo.find(targetId) }
-                    .onFailure {
-                        println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
-                    }
-                    .getOrElse {
-                        api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
-                        return false
-                    }
+        if (snapshot == null) {
+            println("ADMIN-STATUS: requester=$adminId target=$targetId source=$source result=not_found")
+            api.sendMessage(chatId, "Пользователь не найден", parseMode = null)
+            if (showMenuAfter) {
+                showAdminMenu(chatId)
             }
-        }
-        if (info == null) {
-            println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=not_found")
-            api.sendMessage(chatId, "Пользователь не найден. Он ещё ни разу не писал боту.", parseMode = null)
             return false
+        }
+
+        if (!snapshot.existsInUsers) {
+            runCatching { UsersRepo.touch(targetId) }
+                .onFailure {
+                    println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=touch_failed err=${it.message}")
+                }
         }
 
         val now = System.currentTimeMillis()
@@ -1008,11 +1013,20 @@ class TelegramLongPolling(
                 return false
             }
 
+        val messagesTotal = runCatching { MessagesRepo.countTotalUserMessages(targetId) }
+            .onFailure {
+                println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
+            }
+            .getOrElse {
+                api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
+                return false
+            }
+
         val premiumActive = until != null && until > now
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
-        val firstSeenDisplay = if (info.firstSeen > 0) dtf.format(Instant.ofEpochMilli(info.firstSeen)) else "—"
-        val blockedLine = if (info.blockedTs > 0) {
-            val blockedAt = dtf.format(Instant.ofEpochMilli(info.blockedTs))
+        val firstSeenDisplay = snapshot.firstSeen?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        val blockedLine = if (snapshot.blockedTs > 0) {
+            val blockedAt = dtf.format(Instant.ofEpochMilli(snapshot.blockedTs))
             "Статус: неактивен (ошибка доставки $blockedAt)"
         } else {
             "Статус: активен"
@@ -1036,12 +1050,14 @@ class TelegramLongPolling(
             $blockedLine
             $premiumLine
             Сообщений за 7 дней: $messages7d
+            Всего сообщений: $messagesTotal
         """.trimIndent()
 
         api.sendMessage(chatId, statusMessage, parseMode = null)
         println(
-            "ADMIN-STATUS: requester=$adminId target=$targetId premium=$premiumActive until=$untilDisplay " +
-                "messages7d=$messages7d blocked=${info.blockedTs} source=$source"
+            "ADMIN-STATUS: requester=$adminId target=$targetId source=$source result=ok premium=$premiumActive " +
+                "until=$untilDisplay messages7d=$messages7d messagesTotal=$messagesTotal blocked=${snapshot.blockedTs} " +
+                "existsInUsers=${snapshot.existsInUsers}"
         )
         if (showMenuAfter) {
             showAdminMenu(chatId)
@@ -1057,7 +1073,7 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
-        var exists = runCatching { UsersRepo.exists(targetId) }
+        val snapshot = runCatching { UsersRepo.loadSnapshot(targetId) }
             .onFailure {
                 println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
             }
@@ -1065,45 +1081,21 @@ class TelegramLongPolling(
                 api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
                 return false
             }
-        if (!exists) {
-            runCatching { UsersRepo.repairOrphans(source = "admin_grant") }
-                .onFailure {
-                    println(
-                        "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=repair_failed err=${it.message}"
-                    )
-                }
-            exists = runCatching { UsersRepo.exists(targetId) }
-                .onFailure {
-                    println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
-                }
-                .getOrElse {
-                    api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
-                    return false
-                }
-        }
-        if (!exists) {
-            val repaired = runCatching { UsersRepo.repairUser(targetId, source = "admin_grant_${source}") }
-                .onFailure {
-                    println(
-                        "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=repair_single_failed err=${it.message}"
-                    )
-                }
-                .getOrElse { false }
-            if (repaired) {
-                exists = runCatching { UsersRepo.exists(targetId) }
-                    .onFailure {
-                        println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
-                    }
-                    .getOrElse {
-                        api.sendMessage(chatId, "Не удалось получить данные. Проверьте логи.", parseMode = null)
-                        return false
-                    }
+
+        if (snapshot == null) {
+            println("ADMIN-GRANT: requester=$adminId target=$targetId days=$days source=$source result=not_found")
+            api.sendMessage(chatId, "Пользователь не найден", parseMode = null)
+            if (showMenuAfter) {
+                showAdminMenu(chatId)
             }
-        }
-        if (!exists) {
-            println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=not_found")
-            api.sendMessage(chatId, "Пользователь не найден. Он ещё ни разу не писал боту.", parseMode = null)
             return false
+        }
+
+        if (!snapshot.existsInUsers) {
+            runCatching { UsersRepo.touch(targetId) }
+                .onFailure {
+                    println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=touch_failed err=${it.message}")
+                }
         }
 
         val until = runCatching {
@@ -1124,34 +1116,13 @@ class TelegramLongPolling(
                     "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=touch_failed err=${it.message}"
                 )
             }
-        println("ADMIN-GRANT: requester=$adminId target=$targetId days=$days until=$untilDisplay source=$source")
+        println(
+            "ADMIN-GRANT: requester=$adminId target=$targetId days=$days source=$source result=ok until=$untilDisplay existsInUsers=${snapshot.existsInUsers}"
+        )
         if (showMenuAfter) {
             showAdminMenu(chatId)
         }
         return true
-    }
-
-    private fun messageContentForLog(msg: TgMessage): String {
-        val attachmentTag = when {
-            msg.photo?.isNotEmpty() == true -> "[non-text: photo]"
-            msg.document != null -> "[non-text: document]"
-            msg.video != null -> "[non-text: video]"
-            msg.video_note != null -> "[non-text: video_note]"
-            msg.voice != null -> "[non-text: voice]"
-            msg.audio != null -> "[non-text: audio]"
-            msg.sticker != null -> "[non-text: sticker]"
-            msg.animation != null -> "[non-text: animation]"
-            else -> null
-        }
-        if (attachmentTag != null) {
-            val caption = msg.caption?.takeIf { it.isNotBlank() }
-                ?.let { sanitizeAdminInput(it, 200) }
-                ?.takeIf { it.isNotEmpty() }
-                ?.let { " $it" }
-                ?: ""
-            return (attachmentTag + caption).trim()
-        }
-        return msg.text?.takeIf { it.isNotBlank() } ?: "[non-text]"
     }
 
     private fun trackUserActivity(userId: Long, text: String, role: String = "user") {
@@ -1211,35 +1182,46 @@ class TelegramLongPolling(
                         return@launch
                     }
                     val messageChunks = splitMessageForBroadcast(text)
-                    println("ADMIN-BROADCAST: start recipients=${recipients.size} chunks=${messageChunks.size}")
+                    val totalRecipients = recipients.size
+                    println("ADMIN-BROADCAST: start recipients=$totalRecipients chunks=${messageChunks.size}")
                     var attempts = 0
-                    var success = 0
-                    var errors = 0
+                    var sent = 0
+                    var failed = 0
                     var blocked = 0
-                    for (recipient in recipients) {
-                        for (chunk in messageChunks) {
-                            attempts++
-                            val result = sendBroadcastChunk(recipient, chunk)
-                            when (result) {
-                                BroadcastResult.SENT -> success++
-                                BroadcastResult.BLOCKED -> {
-                                    errors++
-                                    blocked++
+                    var processed = 0
+                    recipients.chunked(BROADCAST_BATCH_SIZE).forEach { batch ->
+                        for (recipient in batch) {
+                            processed++
+                            for (chunk in messageChunks) {
+                                attempts++
+                                val result = sendBroadcastChunk(recipient, chunk)
+                                when (result) {
+                                    BroadcastResult.SENT -> sent++
+                                    BroadcastResult.BLOCKED -> {
+                                        blocked++
+                                    }
+                                    BroadcastResult.FAILED -> {
+                                        failed++
+                                    }
                                 }
-                                BroadcastResult.FAILED -> errors++
+                                delay(BROADCAST_RATE_DELAY_MS)
+                                if (result != BroadcastResult.SENT) {
+                                    break
+                                }
                             }
-                            delay(BROADCAST_RATE_DELAY_MS)
-                            if (result == BroadcastResult.BLOCKED) break
                         }
+                        println(
+                            "ADMIN-BROADCAST: progress processed=$processed/$totalRecipients attempts=$attempts sent=$sent failed=$failed blocked=$blocked"
+                        )
                     }
                     val summary = buildString {
-                        append("Готово. Попыток: $attempts, отправлено: $success, ошибок: $errors")
-                        if (blocked > 0) append(" (заблокировано: $blocked)")
-                        appendLine()
-                        append("Получателей: ${recipients.size}")
+                        appendLine("Отправлено: $sent, Пропущено/ошибка: $failed, Заблокировали: $blocked")
+                        append("Всего получателей: $totalRecipients")
                     }
                     api.sendMessage(adminChatId, summary, parseMode = null)
-                    println("ADMIN-BROADCAST: done recipients=${recipients.size} attempts=$attempts success=$success errors=$errors blocked=$blocked")
+                    println(
+                        "ADMIN-BROADCAST: done recipients=$totalRecipients attempts=$attempts sent=$sent failed=$failed blocked=$blocked"
+                    )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
                 }
@@ -1291,8 +1273,8 @@ class TelegramLongPolling(
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
         val stats = runCatching {
             val total = UsersRepo.countUsers(includeBlocked = true)
-            val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
-            val blocked = max(total - activeInstalls, 0L)
+            val blocked = UsersRepo.countBlocked()
+            val activeInstalls = max(total - blocked, 0L)
             val premium = PremiumRepo.countActive()
             val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * 24L * 60L * 60L * 1000L)
             listOf(total, activeInstalls, blocked, premium, active7d)
@@ -1313,9 +1295,7 @@ class TelegramLongPolling(
             appendLine("• Активных установок: $activeInstalls")
             appendLine("• Премиум-пользователей: $premium")
             appendLine("• Активно за 7 дней: $active7d")
-            if (blocked > 0) {
-                appendLine("• Заблокировали бота: $blocked")
-            }
+            appendLine("• Заблокировали бота: $blocked")
         }.trimEnd()
         api.sendMessage(chatId, message, parseMode = null)
     }
