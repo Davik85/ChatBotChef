@@ -750,6 +750,7 @@ class TelegramLongPolling(
         api.sendMessage(chatId, statusMessage, parseMode = null)
         adminStates.remove(chatId)
         println("ADMIN-STATUS: requester=$adminId target=$targetId premium=$premiumActive until=$untilDisplay used=$used")
+        showAdminMenu(chatId)
     }
 
     private fun processAdminGrantInput(chatId: Long, adminId: Long, rawInput: String) {
@@ -790,6 +791,7 @@ class TelegramLongPolling(
         adminStates.remove(chatId)
         api.sendMessage(chatId, "Премиум пользователю $targetId активен до: $untilDisplay", parseMode = null)
         println("ADMIN-GRANT: requester=$adminId target=$targetId days=$days until=$untilDisplay")
+        showAdminMenu(chatId)
     }
 
     private fun messageContentForLog(msg: TgMessage): String {

@@ -358,5 +358,80 @@ object DatabaseFactory {
                 PremiumUsers, PremiumReminders, Payments, UsageCounters, ChatHistory
             )
         }
+
+        transaction {
+            fun tableExists(name: String): Boolean =
+                exec("SELECT name FROM sqlite_master WHERE type='table' AND name='$name'") { rs ->
+                    var found = false
+                    while (rs?.next() == true) found = true
+                    found
+                } ?: false
+
+            fun columnExists(table: String, column: String): Boolean =
+                exec("PRAGMA table_info($table)") { rs ->
+                    var ok = false
+                    while (rs?.next() == true) {
+                        if (rs.getString("name") == column) { ok = true; break }
+                    }
+                    ok
+                } ?: false
+
+            fun countUsers(): Long =
+                exec("SELECT COUNT(*) AS cnt FROM users") { rs ->
+                    var total = 0L
+                    while (rs?.next() == true) total = rs.getLong("cnt")
+                    total
+                } ?: 0L
+
+            val before = if (tableExists("users")) countUsers() else 0L
+
+            fun backfillUsersFrom(
+                table: String,
+                userColumn: String,
+                tsColumn: String? = null
+            ) {
+                if (!tableExists("users") || !tableExists(table) || !columnExists(table, userColumn)) return
+
+                val hasTs = tsColumn != null && columnExists(table, tsColumn)
+                val selectSql = if (hasTs) {
+                    """
+                        SELECT $userColumn AS user_id, MIN($tsColumn) AS first_seen
+                        FROM $table
+                        WHERE $userColumn IS NOT NULL
+                        GROUP BY $userColumn
+                    """.trimIndent()
+                } else {
+                    """
+                        SELECT DISTINCT $userColumn AS user_id, 0 AS first_seen
+                        FROM $table
+                        WHERE $userColumn IS NOT NULL
+                    """.trimIndent()
+                }
+
+                exec(
+                    """
+                        INSERT OR IGNORE INTO users(user_id, first_seen)
+                        $selectSql;
+                    """.trimIndent()
+                )
+            }
+
+            backfillUsersFrom("messages", "user_id", "ts")
+            backfillUsersFrom("chat_history", "user_id", "ts")
+            backfillUsersFrom("memory_notes_v2", "user_id", "ts")
+            backfillUsersFrom("usage_counters", "user_id")
+            backfillUsersFrom("premium_users", "user_id")
+            backfillUsersFrom("premium_reminders", "user_id")
+            backfillUsersFrom("payments", "user_id", "created_at")
+            backfillUsersFrom("user_stats", "user_id")
+
+            if (tableExists("users")) {
+                val after = countUsers()
+                val delta = after - before
+                if (delta > 0) {
+                    println("USERS: backfilled $delta existing users")
+                }
+            }
+        }
     }
 }

@@ -1,10 +1,12 @@
 package app.db
 
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.and
 
 object MessagesRepo {
     private const val MAX_STORED_TEXT = 4000
@@ -38,7 +40,7 @@ object MessagesRepo {
         val distinctUsers = Messages.user_id.countDistinct()
         Messages
             .slice(distinctUsers)
-            .select { Messages.ts.greaterEq(fromMs) }
+            .select { (Messages.ts.greaterEq(fromMs)) and (Messages.role eq "user") }
             .singleOrNull()
             ?.get(distinctUsers)
             ?.toLong()
