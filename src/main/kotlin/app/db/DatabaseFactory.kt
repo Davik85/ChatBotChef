@@ -456,6 +456,9 @@ object DatabaseFactory {
             )
         }
 
+        runCatching { UserRegistry.backfillFromExistingData() }
+            .onFailure { println("WARN: users quick backfill failed: ${it.message}") }
+
         runCatching { UsersRepo.repairOrphans(source = "startup") }
             .onFailure { println("WARN: users backfill failed: ${it.message}") }
     }

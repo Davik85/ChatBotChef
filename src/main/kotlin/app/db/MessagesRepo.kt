@@ -1,6 +1,7 @@
 package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
@@ -42,7 +43,7 @@ object MessagesRepo {
         val countExpr = Messages.user_id.countDistinct()
         Messages
             .slice(countExpr)
-            .select { (Messages.ts.greaterEq(fromMs)) and (Messages.role eq "user") }
+            .select { (Messages.ts greater fromMs) and (Messages.role eq "user") }
             .firstOrNull()
             ?.get(countExpr)
             ?.toLong()

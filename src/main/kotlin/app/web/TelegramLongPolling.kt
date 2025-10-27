@@ -4,6 +4,7 @@ import app.AppConfig
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
+import app.db.UserRegistry
 import app.db.UsersRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
@@ -28,7 +29,6 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.ArrayDeque
 import kotlin.jvm.Volatile
-import kotlin.math.max
 
 class TelegramLongPolling(
     private val token: String,
@@ -241,49 +241,17 @@ class TelegramLongPolling(
         }
     }
 
-    private fun registerUser(userId: Long, context: String) {
-        if (userId <= 0) return
-        val registered = runCatching { UsersRepo.touch(userId) }
-            .onFailure { println("DB-ERR users.touch: user_id=$userId context=$context err=${it.message}") }
-            .getOrElse { false }
-        if (registered) {
-            println("USERS: registered user_id=$userId source=$context")
-        }
-    }
-
-    private fun registerFromUpdate(update: TgUpdate) {
-        val seen = mutableSetOf<Long>()
-        fun collect(id: Long?, source: String) {
-            if (id != null && id > 0 && seen.add(id)) {
-                registerUser(id, source)
+    private fun upsertUser(from: TgUser?, source: String) {
+        val user = from ?: return
+        val now = System.currentTimeMillis()
+        runCatching { UserRegistry.upsert(user, now) }
+            .onSuccess { inserted ->
+                val insertedFlag = if (inserted) 1 else 0
+                println("USER-UPSERT: id=${user.id} source=$source inserted=$insertedFlag")
             }
-        }
-
-        update.message?.let { msg ->
-            collect(msg.from?.id ?: msg.chat.id, "message")
-        }
-        update.edited_message?.let { msg ->
-            collect(msg.from?.id ?: msg.chat.id, "edited_message")
-        }
-        update.callback_query?.let { cb ->
-            collect(cb.from.id, "callback_query")
-            collect(cb.message?.chat?.id, "callback_query_chat")
-        }
-        update.pre_checkout_query?.let { pcq ->
-            collect(pcq.from.id, "pre_checkout_query")
-        }
-        update.my_chat_member?.let { member ->
-            collect(member.from?.id, "my_chat_member_actor")
-            collect(member.chat.id, "my_chat_member_chat")
-            collect(member.new_chat_member?.user?.id, "my_chat_member_user")
-            collect(member.old_chat_member?.user?.id, "my_chat_member_old_user")
-        }
-        update.chat_member?.let { member ->
-            collect(member.from?.id, "chat_member_actor")
-            collect(member.chat.id, "chat_member_chat")
-            collect(member.new_chat_member?.user?.id, "chat_member_user")
-            collect(member.old_chat_member?.user?.id, "chat_member_old_user")
-        }
+            .onFailure {
+                println("USER-UPSERT-ERR: id=${user.id} source=$source reason=${it.message}")
+            }
     }
 
     suspend fun run() {
@@ -299,7 +267,12 @@ class TelegramLongPolling(
                 for (u in updates) {
                     offset = u.update_id + 1
 
-                    registerFromUpdate(u)
+                    u.message?.from?.let { upsertUser(it, "message") }
+                    u.edited_message?.from?.let { upsertUser(it, "message") }
+                    u.callback_query?.let { upsertUser(it.from, "callback") }
+                    u.pre_checkout_query?.let { upsertUser(it.from, "precheckout") }
+                    u.my_chat_member?.from?.let { upsertUser(it, "chat_member") }
+                    u.chat_member?.from?.let { upsertUser(it, "chat_member") }
 
                     val pcq = u.pre_checkout_query
                     if (pcq != null) {
@@ -315,6 +288,7 @@ class TelegramLongPolling(
 
                     val sp = msg.successful_payment
                     if (sp != null) {
+                        upsertUser(msg.from, "payment")
                         handleSuccessfulPayment(msg); continue
                     }
 
@@ -399,7 +373,6 @@ class TelegramLongPolling(
         val msgId = cb.message.message_id
         val userId = cb.from.id
 
-        registerUser(userId, "callback")
         trackUserActivity(userId, "[callback] ${cb.data.orEmpty()}")
 
         when (cb.data) {
@@ -516,8 +489,6 @@ class TelegramLongPolling(
         val chatId = msg.chat.id
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
-
-        registerUser(userId, "message_route")
 
         val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
             msg.document != null ||
@@ -1184,13 +1155,24 @@ class TelegramLongPolling(
             api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
             broadcastJob = GlobalScope.launch {
                 try {
-                    val recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
+                    var recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
                         .onFailure {
                             println("ADMIN-BROADCAST-ERR: failed to load users ${it.message}")
                             api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
                         }
                         .getOrNull()
                         ?: return@launch
+                    if (recipients.isEmpty()) {
+                        runCatching { UserRegistry.backfillFromExistingData() }
+                            .onFailure { println("ADMIN-BROADCAST-ERR: users backfill failed ${it.message}") }
+                        recipients = runCatching { UsersRepo.getAllUserIds(includeBlocked = false) }
+                            .onFailure {
+                                println("ADMIN-BROADCAST-ERR: failed to load users after backfill ${it.message}")
+                                api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
+                            }
+                            .getOrNull()
+                            ?: return@launch
+                    }
                     if (recipients.isEmpty()) {
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
@@ -1232,7 +1214,7 @@ class TelegramLongPolling(
                         )
                     }
                     val summary = buildString {
-                        appendLine("Отправлено: $sentRecipients, Пропущено/ошибка: $failedRecipients, Заблокировали: $blockedRecipients")
+                        appendLine("Отправлено: $sentRecipients, Ошибок: $failedRecipients, Заблокировали: $blockedRecipients")
                         append("Всего получателей: $totalRecipients")
                     }
                     api.sendMessage(adminChatId, summary, parseMode = null)
@@ -1309,10 +1291,10 @@ class TelegramLongPolling(
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
         val stats = runCatching {
             val total = UsersRepo.countUsers(includeBlocked = true)
-            val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
             val blocked = UsersRepo.countBlocked()
             val premium = PremiumRepo.countActive()
             val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
+            val activeInstalls = (total - blocked).coerceAtLeast(0L)
             AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d)
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
@@ -1321,9 +1303,7 @@ class TelegramLongPolling(
         }
         val total = stats.total.coerceAtLeast(0L)
         val blocked = stats.blocked.coerceIn(0L, total)
-        val normalizedActive = stats.activeInstalls.coerceIn(0L, total)
-        val fallbackActive = (total - blocked).coerceAtLeast(0L)
-        val activeInstalls = max(normalizedActive, fallbackActive).coerceAtMost(total)
+        val activeInstalls = (total - blocked).coerceAtLeast(0L)
         val premium = stats.premium.coerceAtLeast(0L)
         val active7d = stats.active7d.coerceAtLeast(0L)
         println("ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")

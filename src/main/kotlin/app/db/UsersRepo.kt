@@ -8,7 +8,6 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.countDistinct
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -60,13 +59,12 @@ object UsersRepo {
     }
 
     fun countUsers(includeBlocked: Boolean = true): Long = transaction {
-        val distinctUsers = Users.user_id.countDistinct()
         val query = if (includeBlocked) {
-            Users.slice(distinctUsers).selectAll()
+            Users.selectAll()
         } else {
-            Users.slice(distinctUsers).select { Users.blocked eq false }
+            Users.select { Users.blocked eq false }
         }
-        query.firstOrNull()?.get(distinctUsers)?.toLong() ?: 0L
+        query.count().toLong()
     }
 
     fun countBlocked(): Long = transaction {
