@@ -2,7 +2,6 @@ package app.db
 
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.less
 import org.jetbrains.exposed.sql.deleteWhere
-import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.transactions.transaction
 
 object ProcessedUpdatesRepo {
@@ -13,10 +12,10 @@ object ProcessedUpdatesRepo {
         if (updateId <= 0L) return true
         val inserted = runCatching {
             transaction {
-                val result = ProcessedUpdates.insertIgnore {
-                    it[ProcessedUpdates.update_id] = updateId
-                }
-                result.insertedCount > 0
+                val affected = exec(
+                    "INSERT OR IGNORE INTO processed_updates (update_id) VALUES ($updateId)"
+                ) ?: 0
+                affected != 0
             }
         }.onFailure {
             println("TG-POLL-ERR: failed_to_mark_processed update=$updateId reason=${it.message}")
