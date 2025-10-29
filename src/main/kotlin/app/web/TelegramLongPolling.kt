@@ -1,10 +1,12 @@
 package app.web
 
 import app.AppConfig
+import app.db.AdminAuditRepo
 import app.db.AudienceRepo
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
+import app.db.ProcessedUpdatesRepo
 import app.db.UserRegistry
 import app.db.UsersRepo
 import app.llm.OpenAIClient
@@ -84,6 +86,9 @@ class TelegramLongPolling(
         private const val BROADCAST_BATCH_SIZE = 500
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private val NON_TEXT_REPLY = "Я работаю только с текстом. Пришлите запрос текстом."
+        private const val MAX_USER_MESSAGE_CHARS = 3500
+        private val TOO_LONG_REPLY =
+            "Сообщение слишком длинное. Пожалуйста, сократите запрос и отправьте ещё раз."
 
         private val START_GREETING_RU = """
             Привет-привет! 👋 Я Шеф-Повар-Бот, и я готов стать вашим надежным помощником на кухне!
@@ -248,10 +253,10 @@ class TelegramLongPolling(
         runCatching { UserRegistry.upsert(user, now) }
             .onSuccess { inserted ->
                 val insertedFlag = if (inserted) 1 else 0
-                println("USER-UPSERT: id=${user.id} source=$source inserted=$insertedFlag")
+                println("DB-USERS-UPSERT: id=${user.id} source=$source inserted=$insertedFlag")
             }
             .onFailure {
-                println("USER-UPSERT-ERR: id=${user.id} source=$source reason=${it.message}")
+                println("DB-USERS-UPSERT-ERR: id=${user.id} source=$source reason=${it.message}")
             }
     }
 
@@ -267,6 +272,11 @@ class TelegramLongPolling(
 
                 for (u in updates) {
                     offset = u.update_id + 1
+
+                    if (!ProcessedUpdatesRepo.markProcessed(u.update_id)) {
+                        println("TG-POLL-SKIP: update=${u.update_id} reason=duplicate")
+                        continue
+                    }
 
                     u.message?.from?.let { upsertUser(it, "message") }
                     u.edited_message?.from?.let { upsertUser(it, "message") }
@@ -296,7 +306,7 @@ class TelegramLongPolling(
                     route(msg)
                 }
             } catch (t: Throwable) {
-                println("POLLING-ERR: ${t.message}")
+                println("TG-POLL-ERR: ${t.message}")
                 delay(1500)
             }
         }
@@ -416,7 +426,8 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
-                println("ADMIN: select broadcast chat=$chatId user=$userId")
+                println("ADMIN-AUDIT: action=broadcast_prompt chat=$chatId user=$userId source=menu")
+                AdminAuditRepo.record(userId, action = "broadcast_prompt", target = chatId.toString(), meta = "source=menu")
                 adminStates[chatId] = AdminState.AwaitingBroadcastText
                 api.sendMessage(chatId, "Пришлите текст рассылки одним сообщением.", parseMode = null)
             }
@@ -426,7 +437,8 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
-                println("ADMIN: select stats chat=$chatId user=$userId")
+                println("ADMIN-AUDIT: action=stats_request chat=$chatId user=$userId source=menu")
+                AdminAuditRepo.record(userId, action = "stats_request", target = chatId.toString(), meta = "source=menu")
                 sendAdminStats(chatId)
             }
             CB_ADMIN_USER_STATUS -> {
@@ -435,7 +447,8 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
-                println("ADMIN: select user_status chat=$chatId user=$userId")
+                println("ADMIN-AUDIT: action=status_prompt chat=$chatId user=$userId source=menu")
+                AdminAuditRepo.record(userId, action = "status_prompt", target = chatId.toString(), meta = "source=menu")
                 adminStates[chatId] = AdminState.AwaitingUserIdForStatus
                 api.sendMessage(chatId, "Введите числовой Telegram ID пользователя.", parseMode = null)
             }
@@ -445,7 +458,8 @@ class TelegramLongPolling(
                     api.sendMessage(chatId, "Команда доступна только админам.")
                     return
                 }
-                println("ADMIN: select grant chat=$chatId user=$userId")
+                println("ADMIN-AUDIT: action=grant_prompt chat=$chatId user=$userId source=menu")
+                AdminAuditRepo.record(userId, action = "grant_prompt", target = chatId.toString(), meta = "source=menu")
                 adminStates[chatId] = AdminState.AwaitingGrantParams
                 api.sendMessage(
                     chatId,
@@ -462,7 +476,14 @@ class TelegramLongPolling(
                 val prepared = adminStates[chatId]
                 if (prepared is AdminState.AwaitingConfirmation) {
                     api.deleteInlineKeyboard(chatId, msgId)
-                    startBroadcast(chatId, prepared.text)
+                    println("ADMIN-AUDIT: action=broadcast_confirm chat=$chatId user=$userId chars=${prepared.text.length}")
+                    AdminAuditRepo.record(
+                        adminId = userId,
+                        action = "broadcast_confirm",
+                        target = chatId.toString(),
+                        meta = "chars=${prepared.text.length}"
+                    )
+                    startBroadcast(chatId, prepared.text, userId)
                 } else {
                     api.sendMessage(chatId, "Нет подготовленной рассылки.", parseMode = null)
                 }
@@ -475,6 +496,8 @@ class TelegramLongPolling(
                 }
                 api.deleteInlineKeyboard(chatId, msgId)
                 if (adminStates.remove(chatId) != null) {
+                    println("ADMIN-AUDIT: action=broadcast_cancel chat=$chatId user=$userId source=menu")
+                    AdminAuditRepo.record(userId, action = "broadcast_cancel", target = chatId.toString(), meta = "source=menu")
                     api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
                 } else {
                     api.sendMessage(chatId, "Нет подготовленной рассылки.", parseMode = null)
@@ -510,6 +533,10 @@ class TelegramLongPolling(
             return
         }
         val text = originalText.trim()
+        if (text.length > MAX_USER_MESSAGE_CHARS) {
+            api.sendMessage(chatId, TOO_LONG_REPLY, parseMode = null)
+            return
+        }
         val lower = text.lowercase()
 
         trackUserActivity(userId, originalText)
@@ -518,8 +545,9 @@ class TelegramLongPolling(
             if (!isAdmin(userId)) {
                 api.sendMessage(chatId, "Команда доступна только админам.")
             } else {
-                println("ADMIN: command /admin chat=$chatId user=$userId")
-                showAdminMenu(chatId)
+                println("ADMIN-AUDIT: action=menu_open chat=$chatId user=$userId source=command")
+                AdminAuditRepo.record(userId, action = "menu_open", target = chatId.toString(), meta = "source=command")
+                showAdminMenu(chatId, userId)
             }
             return
         }
@@ -528,12 +556,19 @@ class TelegramLongPolling(
         if (adminState != null) {
             if (!isAdmin(userId)) {
                 adminStates.remove(chatId)
+                println("ADMIN-AUDIT: action=state_force_exit chat=$chatId user=$userId reason=non_admin")
             } else {
                 if (tryHandleAdminStateInput(chatId, userId, originalText)) {
                     return
                 }
                 adminStates.remove(chatId)
-                println("ADMIN: exit_state chat=$chatId user=$userId state=$adminState reason=non_admin_input")
+                println("ADMIN-AUDIT: action=state_exit chat=$chatId user=$userId state=$adminState reason=unhandled_input")
+                AdminAuditRepo.record(
+                    adminId = userId,
+                    action = "state_exit",
+                    target = chatId.toString(),
+                    meta = "state=$adminState"
+                )
             }
         }
 
@@ -615,7 +650,8 @@ class TelegramLongPolling(
             AdminState.AwaitingBroadcastText -> {
                 if (lower == "/cancel") {
                     adminStates.remove(chatId)
-                    println("ADMIN: broadcast_cancel chat=$chatId user=$adminId stage=text")
+                    println("ADMIN-AUDIT: action=broadcast_cancel chat=$chatId user=$adminId source=state")
+                    AdminAuditRepo.record(adminId, action = "broadcast_cancel", target = chatId.toString(), meta = "source=state")
                     api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
                     true
                 } else if (trimmed.startsWith("/")) {
@@ -624,7 +660,13 @@ class TelegramLongPolling(
                     val prepared = validateBroadcastText(chatId, rawInput)
                     if (prepared != null) {
                         adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
-                        println("ADMIN: broadcast_prepared chat=$chatId user=$adminId chars=${prepared.length}")
+                        println("ADMIN-AUDIT: action=broadcast_prepared chat=$chatId user=$adminId chars=${prepared.length}")
+                        AdminAuditRepo.record(
+                            adminId,
+                            action = "broadcast_prepared",
+                            target = chatId.toString(),
+                            meta = "chars=${prepared.length}"
+                        )
                         api.sendMessage(
                             chatId,
                             "Отправить рассылку всем пользователям?\n\n$prepared",
@@ -638,7 +680,13 @@ class TelegramLongPolling(
             is AdminState.AwaitingConfirmation -> {
                 if (lower == "/cancel") {
                     adminStates.remove(chatId)
-                    println("ADMIN: broadcast_cancel chat=$chatId user=$adminId stage=confirm")
+                    println("ADMIN-AUDIT: action=broadcast_cancel chat=$chatId user=$adminId source=state_confirm")
+                    AdminAuditRepo.record(
+                        adminId,
+                        action = "broadcast_cancel",
+                        target = chatId.toString(),
+                        meta = "source=state_confirm"
+                    )
                     api.sendMessage(chatId, "Рассылка отменена.", parseMode = null)
                     true
                 } else if (trimmed.startsWith("/")) {
@@ -647,7 +695,13 @@ class TelegramLongPolling(
                     val prepared = validateBroadcastText(chatId, rawInput)
                     if (prepared != null) {
                         adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
-                        println("ADMIN: broadcast_updated chat=$chatId user=$adminId chars=${prepared.length}")
+                        println("ADMIN-AUDIT: action=broadcast_updated chat=$chatId user=$adminId chars=${prepared.length}")
+                        AdminAuditRepo.record(
+                            adminId,
+                            action = "broadcast_updated",
+                            target = chatId.toString(),
+                            meta = "chars=${prepared.length}"
+                        )
                         api.sendMessage(
                             chatId,
                             "Отправить рассылку всем пользователям?\n\n$prepared",
@@ -661,7 +715,8 @@ class TelegramLongPolling(
             AdminState.AwaitingUserIdForStatus -> {
                 if (lower == "/cancel") {
                     adminStates.remove(chatId)
-                    println("ADMIN: status_cancel chat=$chatId user=$adminId")
+                    println("ADMIN-AUDIT: action=status_cancel chat=$chatId user=$adminId")
+                    AdminAuditRepo.record(adminId, action = "status_cancel", target = chatId.toString(), meta = null)
                     api.sendMessage(chatId, "Операция отменена.", parseMode = null)
                     true
                 } else if (trimmed.startsWith("/")) {
@@ -693,7 +748,8 @@ class TelegramLongPolling(
             AdminState.AwaitingGrantParams -> {
                 if (lower == "/cancel") {
                     adminStates.remove(chatId)
-                    println("ADMIN: grant_cancel chat=$chatId user=$adminId")
+                    println("ADMIN-AUDIT: action=grant_cancel chat=$chatId user=$adminId")
+                    AdminAuditRepo.record(adminId, action = "grant_cancel", target = chatId.toString(), meta = null)
                     api.sendMessage(chatId, "Операция отменена.", parseMode = null)
                     true
                 } else if (trimmed.startsWith("/")) {
@@ -949,6 +1005,7 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
+        AdminAuditRepo.record(adminId, action = "status_lookup", target = targetId.toString(), meta = "source=$source")
         val snapshot = runCatching { UsersRepo.loadSnapshot(targetId) }
             .onFailure {
                 println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
@@ -962,7 +1019,7 @@ class TelegramLongPolling(
             println("ADMIN-STATUS: requester=$adminId target=$targetId source=$source result=not_found")
             api.sendMessage(chatId, "Пользователь не найден", parseMode = null)
             if (showMenuAfter) {
-                showAdminMenu(chatId)
+                showAdminMenu(chatId, adminId)
             }
             return false
         }
@@ -1058,6 +1115,12 @@ class TelegramLongPolling(
         source: String,
         showMenuAfter: Boolean
     ): Boolean {
+        AdminAuditRepo.record(
+            adminId,
+            action = "grant_request",
+            target = targetId.toString(),
+            meta = "days=$days source=$source"
+        )
         val snapshot = runCatching { UsersRepo.loadSnapshot(targetId) }
             .onFailure {
                 println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=${it.message}")
@@ -1106,7 +1169,7 @@ class TelegramLongPolling(
                 "existsInUsers=${snapshot.existsInUsers} blocked=${snapshot.blocked} blockedTs=${snapshot.blockedTs}"
         )
         if (showMenuAfter) {
-            showAdminMenu(chatId)
+            showAdminMenu(chatId, adminId)
         }
         return true
     }
@@ -1115,8 +1178,9 @@ class TelegramLongPolling(
         val sanitized = sanitizeActivityText(text) ?: return
         runCatching { MessagesRepo.record(userId, sanitized, role) }
             .onFailure {
-                val snippet = sanitized.take(200).replace('\n', ' ')
-                println("DB-ERR messages.record: user_id=$userId role=$role text=$snippet err=${it.message}")
+                println(
+                    "DB-MESSAGES-ERR: user_id=$userId role=$role chars=${sanitized.length} reason=${it.message}"
+                )
             }
     }
 
@@ -1145,15 +1209,15 @@ class TelegramLongPolling(
         return result
     }
 
-    private fun startBroadcast(adminChatId: Long, text: String) {
+    private fun startBroadcast(adminChatId: Long, text: String, adminId: Long) {
         adminStates.remove(adminChatId)
         synchronized(broadcastMutex) {
             val current = broadcastJob
             if (current?.isActive == true) {
                 api.sendMessage(adminChatId, "Рассылка уже выполняется. Дождитесь завершения текущей отправки.", parseMode = null)
-                return
-            }
-            api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
+                    return
+                }
+                api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
             broadcastJob = GlobalScope.launch {
                 try {
                     val context = runCatching { AudienceRepo.createContext(includeBlocked = false) }
@@ -1171,6 +1235,12 @@ class TelegramLongPolling(
                     val messageChunks = splitMessageForBroadcast(text)
                     println(
                         "ADMIN-BROADCAST-START: admin=$adminChatId recipients=$totalRecipients chunks=${messageChunks.size}"
+                    )
+                    AdminAuditRepo.record(
+                        adminId = adminId,
+                        action = "broadcast_start",
+                        target = adminChatId.toString(),
+                        meta = "recipients=$totalRecipients chunks=${messageChunks.size}"
                     )
                     var attempts = 0L
                     var sentRecipients = 0L
@@ -1213,6 +1283,12 @@ class TelegramLongPolling(
                     val errors = failedRecipients + blockedRecipients
                     val summary = "Отправлено: $sentRecipients, ошибок: $errors"
                     api.sendMessage(adminChatId, summary, parseMode = null)
+                    AdminAuditRepo.record(
+                        adminId = adminId,
+                        action = "broadcast_done",
+                        target = adminChatId.toString(),
+                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
+                    )
                     println(
                         "ADMIN-BROADCAST-DONE: admin=$adminChatId recipients=$totalRecipients attempts=$attempts sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
                     )
@@ -1317,9 +1393,11 @@ class TelegramLongPolling(
         api.sendMessage(chatId, message, parseMode = null)
     }
 
-    private fun showAdminMenu(chatId: Long) {
+    private fun showAdminMenu(chatId: Long, adminId: Long? = null) {
         adminStates.remove(chatId)
-        println("ADMIN: show_menu chat=$chatId")
+        val actor = adminId ?: chatId
+        println("ADMIN-AUDIT: action=menu_show chat=$chatId actor=$actor")
+        AdminAuditRepo.record(actor, action = "menu_show", target = chatId.toString(), meta = null)
         api.sendMessage(chatId, "Админ-панель. Выберите действие:", replyMarkup = adminMenuKeyboard(), parseMode = null)
     }
 

@@ -31,6 +31,12 @@ class OpenAIClient(
         .callTimeout(Duration.ofSeconds(90))
         .build()
 
+    private fun sanitizeBody(body: String, maxLen: Int = 400): String =
+        body.replace("\n", " ").replace("\r", " ").take(maxLen)
+
+    private fun isUnsupportedRegion(body: String): Boolean =
+        body.contains("unsupported_country_region_territory", ignoreCase = true)
+
     /** Общие заголовки с учётом project/org. */
     private fun headers(): okhttp3.Headers {
         val b = okhttp3.Headers.Builder()
@@ -55,13 +61,16 @@ class OpenAIClient(
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     val body = resp.body?.string().orEmpty()
-                    println("OPENAI-HEALTH: HTTP ${resp.code} ${resp.message} body=$body")
+                    val safeBody = sanitizeBody(body)
+                    val unsupported = resp.code == 403 && isUnsupportedRegion(body)
+                    val reason = if (unsupported) "unsupported_region" else "http_error"
+                    println("OPENAI-HEALTH-ERR: code=${resp.code} reason=$reason body=$safeBody")
                     return false
                 }
                 true
             }
         }.onFailure { e ->
-            println("OPENAI-HEALTH-ERR: ${e.message}")
+            println("OPENAI-HEALTH-ERR: exception=${e.message}")
         }.getOrDefault(false)
     }
 
@@ -70,36 +79,66 @@ class OpenAIClient(
      * Отправляем max_tokens. temperature — только если поддерживается.
      */
     fun complete(messages: List<ChatMessage>): String {
-        return runCatching {
-            val body: MutableMap<String, Any> = mutableMapOf(
-                "model" to model,
-                "messages" to messages,           // ChatMessage должен иметь поля role/content
-                "max_tokens" to maxCompletionTokens
-            )
-            if (supportsTemperature(model) && temperature != null) {
-                body["temperature"] = temperature
-            }
+        val payload: MutableMap<String, Any> = mutableMapOf(
+            "model" to model,
+            "messages" to messages,
+            "max_tokens" to maxCompletionTokens
+        )
+        if (supportsTemperature(model) && temperature != null) {
+            payload["temperature"] = temperature
+        }
 
-            val req = Request.Builder()
-                .url(AppConfig.OPENAI_URL)        // https://api.openai.com/v1/chat/completions
-                .headers(headers())
-                .post(mapper.writeValueAsString(body).toRequestBody(json))
-                .build()
+        val requestBody = mapper.writeValueAsString(payload).toRequestBody(json)
+        val request = Request.Builder()
+            .url(AppConfig.OPENAI_URL)
+            .headers(headers())
+            .post(requestBody)
+            .build()
 
-            http.newCall(req).execute().use { resp ->
-                val raw = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) {
-                    println("OPENAI-HTTP-ERR: code=${resp.code} msg=${resp.message} body=$raw")
-                    return AppConfig.FALLBACK_REPLY
+        val maxAttempts = 3
+        for (attempt in 1..maxAttempts) {
+            try {
+                var shouldRetry = false
+                http.newCall(request).execute().use { resp ->
+                    val raw = resp.body?.string().orEmpty()
+                    if (!resp.isSuccessful) {
+                        val safe = sanitizeBody(raw)
+                        val unsupported = resp.code == 403 && isUnsupportedRegion(raw)
+                        val reason = when {
+                            unsupported -> "unsupported_region"
+                            resp.code == 429 -> "rate_limited"
+                            resp.code >= 500 -> "server_error"
+                            else -> "http_error"
+                        }
+                        println("OPENAI-HTTP-ERR: attempt=$attempt code=${resp.code} reason=$reason body=$safe")
+                        if (unsupported) {
+                            return AppConfig.FALLBACK_REPLY
+                        }
+                        shouldRetry = attempt < maxAttempts && (resp.code == 429 || resp.code >= 500)
+                        if (!shouldRetry) {
+                            return AppConfig.FALLBACK_REPLY
+                        }
+                        return@use
+                    }
+                    val parsed: ChatResponse = mapper.readValue(raw)
+                    val reply = parsed.choices.firstOrNull()?.message?.content?.trim()
+                        .takeUnless { it.isNullOrBlank() }
+                        ?: AppConfig.FALLBACK_REPLY
+                    return reply.take(AppConfig.MAX_REPLY_CHARS)
                 }
-                val parsed: ChatResponse = mapper.readValue(raw)
-                parsed.choices.firstOrNull()?.message?.content?.trim()
-                    .takeUnless { it.isNullOrBlank() }
-                    ?: AppConfig.FALLBACK_REPLY
+                if (shouldRetry) {
+                    Thread.sleep(300L * attempt * attempt)
+                    continue
+                }
+            } catch (e: Exception) {
+                println("OPENAI-COMPLETE-ERR: attempt=$attempt reason=${e.message}")
+                if (attempt < maxAttempts) {
+                    Thread.sleep(300L * attempt * attempt)
+                    continue
+                }
             }
-        }.onFailure { e ->
-            println("OPENAI-COMPLETE-ERR: ${e.message}")
-        }.getOrDefault(AppConfig.FALLBACK_REPLY)
+        }
+        return AppConfig.FALLBACK_REPLY
     }
 
     private fun supportsTemperature(model: String): Boolean {
