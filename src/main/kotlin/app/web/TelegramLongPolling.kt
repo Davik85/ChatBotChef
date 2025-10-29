@@ -263,7 +263,10 @@ class TelegramLongPolling(
     suspend fun run() {
         require(api.getMe()) { "Telegram getMe failed" }
         GlobalScope.launch { ReminderJob(api).runForever() }
-        var offset: Long? = null
+
+        var lastProcessedId = ProcessedUpdatesRepo.lastProcessedId()
+        var offset: Long = lastProcessedId + 1
+        println("OFFSET init last_id=$lastProcessedId offset=$offset")
 
         while (true) {
             try {
@@ -271,12 +274,19 @@ class TelegramLongPolling(
                 if (updates.isEmpty()) { delay(1200); continue }
 
                 for (u in updates) {
-                    offset = u.update_id + 1
-
-                    if (!ProcessedUpdatesRepo.markProcessed(u.update_id)) {
+                    println("RECV update_id=${u.update_id}")
+                    val firstSeen = ProcessedUpdatesRepo.tryInsert(u.update_id)
+                    if (!firstSeen) {
+                        println("DEDUP duplicate update_id=${u.update_id}")
                         println("TG-POLL-SKIP: update=${u.update_id} reason=duplicate")
+                        if (u.update_id > lastProcessedId) {
+                            lastProcessedId = u.update_id
+                            offset = lastProcessedId + 1
+                        }
                         continue
                     }
+
+                    println("DEDUP first_seen update_id=${u.update_id}")
 
                     u.message?.from?.let { upsertUser(it, "message") }
                     u.edited_message?.from?.let { upsertUser(it, "message") }
@@ -285,25 +295,38 @@ class TelegramLongPolling(
                     u.my_chat_member?.from?.let { upsertUser(it, "chat_member") }
                     u.chat_member?.from?.let { upsertUser(it, "chat_member") }
 
-                    val pcq = u.pre_checkout_query
-                    if (pcq != null) {
-                        handlePreCheckout(pcq); continue
+                    val handledSuccessfully = try {
+                        val pcq = u.pre_checkout_query
+                        if (pcq != null) {
+                            handlePreCheckout(pcq)
+                        } else {
+                            val cb: TgCallbackQuery? = u.callback_query
+                            if (cb != null) {
+                                handleCallback(cb)
+                            } else {
+                                val msg = u.message ?: u.edited_message
+                                if (msg != null) {
+                                    val sp = msg.successful_payment
+                                    if (sp != null) {
+                                        upsertUser(msg.from, "payment")
+                                        handleSuccessfulPayment(msg)
+                                    } else {
+                                        route(msg)
+                                    }
+                                }
+                            }
+                        }
+                        true
+                    } catch (t: Throwable) {
+                        println("HANDLE-ERR update_id=${u.update_id} cause=${t::class.simpleName}:${t.message}")
+                        ProcessedUpdatesRepo.remove(u.update_id)
+                        false
                     }
 
-                    val cb: TgCallbackQuery? = u.callback_query
-                    if (cb != null) {
-                        handleCallback(cb); continue
+                    if (handledSuccessfully && u.update_id > lastProcessedId) {
+                        lastProcessedId = u.update_id
+                        offset = lastProcessedId + 1
                     }
-
-                    val msg = u.message ?: u.edited_message ?: continue
-
-                    val sp = msg.successful_payment
-                    if (sp != null) {
-                        upsertUser(msg.from, "payment")
-                        handleSuccessfulPayment(msg); continue
-                    }
-
-                    route(msg)
                 }
             } catch (t: Throwable) {
                 println("TG-POLL-ERR: ${t.message}")
