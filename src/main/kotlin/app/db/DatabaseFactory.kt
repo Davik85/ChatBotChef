@@ -4,6 +4,8 @@ import app.AppConfig
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.sqlite.SQLiteConfig
+import org.sqlite.SQLiteDataSource
 import java.io.File
 import java.sql.Connection
 import kotlin.io.use
@@ -110,17 +112,12 @@ object DatabaseFactory {
 
         // 2) подключаемся к SQLite (FK включены)
         val url = "jdbc:sqlite:${AppConfig.DB_PATH}?foreign_keys=on"
-        Database.connect(
-            url = url,
-            driver = "org.sqlite.JDBC",
-            setupConnection = { conn ->
-                conn.createStatement().use { stmt ->
-                    stmt.execute("PRAGMA foreign_keys = ON")
-                }
-            }
-        )
-
-        transaction { exec("PRAGMA foreign_keys = ON;") }
+        val dataSource = SQLiteConfig().apply {
+            enforceForeignKeys(true)
+        }.let { cfg ->
+            SQLiteDataSource(cfg).also { it.url = url }
+        }
+        Database.connect(dataSource)
 
         // 3) уровень изоляции
         TransactionManager.manager.defaultIsolationLevel = Connection.TRANSACTION_SERIALIZABLE
