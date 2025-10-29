@@ -4,8 +4,11 @@ import app.AppConfig
 import org.jetbrains.exposed.sql.*
 import org.jetbrains.exposed.sql.transactions.TransactionManager
 import org.jetbrains.exposed.sql.transactions.transaction
+import org.sqlite.SQLiteConfig
+import org.sqlite.SQLiteDataSource
 import java.io.File
 import java.sql.Connection
+import kotlin.io.use
 
 // ---------- Таблицы (актуальная схема) ----------
 object Users : Table(name = "users") {
@@ -91,6 +94,16 @@ object ChatHistory : Table(name = "chat_history") {
     override val primaryKey = PrimaryKey(id)
 }
 
+object AdminAudit : Table(name = "admin_audit") {
+    val id = long("id").autoIncrement()
+    val admin_id = long("admin_id").index()
+    val action = varchar("action", length = 64)
+    val target = varchar("target", length = 128).nullable()
+    val meta = varchar("meta", length = 256).nullable()
+    val ts = long("ts")
+    override val primaryKey = PrimaryKey(id)
+}
+
 object DatabaseFactory {
 
     fun init() {
@@ -99,7 +112,12 @@ object DatabaseFactory {
 
         // 2) подключаемся к SQLite (FK включены)
         val url = "jdbc:sqlite:${AppConfig.DB_PATH}?foreign_keys=on"
-        Database.connect(url = url, driver = "org.sqlite.JDBC")
+        val dataSource = SQLiteConfig().apply {
+            enforceForeignKeys(true)
+        }.let { cfg ->
+            SQLiteDataSource(cfg).also { it.url = url }
+        }
+        Database.connect(dataSource)
 
         // 3) уровень изоляции
         TransactionManager.manager.defaultIsolationLevel = Connection.TRANSACTION_SERIALIZABLE
@@ -455,7 +473,7 @@ object DatabaseFactory {
         transaction {
             SchemaUtils.createMissingTablesAndColumns(
                 Users, Messages, MemoryNotesV2, UserStats, ProcessedUpdates,
-                PremiumUsers, PremiumReminders, Payments, UsageCounters, ChatHistory
+                PremiumUsers, PremiumReminders, Payments, UsageCounters, ChatHistory, AdminAudit
             )
         }
 

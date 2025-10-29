@@ -34,12 +34,24 @@ class TelegramApi(private val token: String) {
     private val debugPaymentsLogging =
         (System.getenv("DEBUG") ?: System.getProperty("DEBUG"))?.equals("true", ignoreCase = true) == true
 
+    private fun sanitizeBody(body: String, limit: Int = 400): String =
+        body.replace("\n", " ").replace("\r", " ").take(limit)
+
     fun getMe(): Boolean {
         val req = Request.Builder().url(url("getMe")).get().build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            val parsed: TgApiResp<Map<String, Any?>> = mapper.readValue(raw)
-            return parsed.ok
+            if (!r.isSuccessful) {
+                println("TG-HTTP-ERR getMe: code=${r.code} body=${sanitizeBody(raw)}")
+                return false
+            }
+            return try {
+                val parsed: TgApiResp<Map<String, Any?>> = mapper.readValue(raw)
+                parsed.ok
+            } catch (e: Exception) {
+                println("TG-JSON-ERR getMe: ${e.message} body=${sanitizeBody(raw)}")
+                false
+            }
         }
     }
 
@@ -60,8 +72,17 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("getUpdates")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(raw)
-            return parsed.result ?: emptyList()
+            if (!r.isSuccessful) {
+                println("TG-HTTP-ERR getUpdates: code=${r.code} body=${sanitizeBody(raw)}")
+                return emptyList()
+            }
+            return try {
+                val parsed: TgApiResp<List<TgUpdate>> = mapper.readValue(raw)
+                parsed.result ?: emptyList()
+            } catch (e: Exception) {
+                println("TG-JSON-ERR getUpdates: ${e.message} body=${sanitizeBody(raw)}")
+                emptyList()
+            }
         }
     }
 
@@ -225,11 +246,12 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendInvoice")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
+            val rawSafe = sanitizeBody(raw)
             if (debugPaymentsLogging) {
-                println("PAYMENT-WARN: sendInvoice debug response_code=${r.code} body=$raw")
+                println("PAYMENT-WARN: sendInvoice debug response_code=${r.code} body=$rawSafe")
             }
             if (!r.isSuccessful) {
-                println("TG-HTTP-ERR sendInvoice: code=${r.code} body=$raw req=$reqJsonSafe")
+                println("TG-HTTP-ERR sendInvoice: code=${r.code} body=$rawSafe req=$reqJsonSafe")
                 return false
             }
             return try {
@@ -237,11 +259,11 @@ class TelegramApi(private val token: String) {
                 if (!parsed.ok) {
                     val errorCode = parsed.error_code?.toString() ?: "unknown"
                     val description = parsed.description ?: "unknown"
-                    println("TG-API-ERR sendInvoice: error_code=$errorCode description=$description raw=$raw req=$reqJsonSafe")
+                    println("TG-API-ERR sendInvoice: error_code=$errorCode description=$description raw=$rawSafe req=$reqJsonSafe")
                 }
                 parsed.ok
             } catch (t: Throwable) {
-                println("TG-JSON-ERR sendInvoice: ${t.message} raw=$raw req=$reqJsonSafe")
+                println("TG-JSON-ERR sendInvoice: ${t.message} raw=$rawSafe req=$reqJsonSafe")
                 false
             }
         }
