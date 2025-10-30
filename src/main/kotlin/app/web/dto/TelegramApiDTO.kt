@@ -121,6 +121,17 @@ data class TgAnimation(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class TgMessageEntity(
+    val type: String,
+    val offset: Int,
+    val length: Int,
+    val url: String? = null,
+    val user: TgUser? = null,
+    val language: String? = null,
+    val custom_emoji_id: String? = null,
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class TgMessage(
     val message_id: Int,
     val from: TgUser? = null,
@@ -128,6 +139,8 @@ data class TgMessage(
     val date: Long? = null,
     val text: String? = null,
     val caption: String? = null,
+    val entities: List<TgMessageEntity>? = null,
+    val caption_entities: List<TgMessageEntity>? = null,
 
     val photo: List<TgPhotoSize>? = null,
     val document: TgDocument? = null,
@@ -144,6 +157,9 @@ data class TgMessage(
     // Вспомогательные поля
     val reply_to_message: TgMessage? = null
 )
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TgMessageId(val message_id: Int)
 
 // ==== CALLBACK-КНОПКИ ====
 
