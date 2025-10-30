@@ -91,15 +91,17 @@ class TelegramApi(private val token: String) {
         text: String,
         replyMarkup: InlineKeyboardMarkup? = null,
         parseMode: String? = "Markdown",
-        maxChars: Int = AppConfig.MAX_REPLY_CHARS
-    ): Int? = sendMessageDetailed(chatId, text, replyMarkup, parseMode, maxChars).messageId
+        maxChars: Int = AppConfig.MAX_REPLY_CHARS,
+        entities: List<TgMessageEntity>? = null,
+    ): Int? = sendMessageDetailed(chatId, text, replyMarkup, parseMode, maxChars, entities).messageId
 
     fun sendMessageDetailed(
         chatId: Long,
         text: String,
         replyMarkup: InlineKeyboardMarkup? = null,
         parseMode: String? = "Markdown",
-        maxChars: Int = AppConfig.MAX_REPLY_CHARS
+        maxChars: Int = AppConfig.MAX_REPLY_CHARS,
+        entities: List<TgMessageEntity>? = null,
     ): TelegramSendResult {
         val limitedText = if (maxChars > 0 && text.length > maxChars) {
             text.substring(0, maxChars)
@@ -107,7 +109,9 @@ class TelegramApi(private val token: String) {
             text
         }
         val args = mutableMapOf<String, Any>("chat_id" to chatId, "text" to limitedText)
-        if (parseMode != null) {
+        if (entities != null) {
+            args["entities"] = entities
+        } else if (parseMode != null) {
             args["parse_mode"] = parseMode
         }
         if (replyMarkup != null) args["reply_markup"] = replyMarkup
@@ -117,6 +121,46 @@ class TelegramApi(private val token: String) {
             val raw = r.body?.string().orEmpty()
             return try {
                 val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                val success = parsed.ok && r.isSuccessful
+                TelegramSendResult(
+                    ok = success,
+                    messageId = parsed.result?.message_id,
+                    errorCode = if (success) null else parsed.error_code ?: r.code,
+                    description = parsed.description ?: if (r.isSuccessful) null else "HTTP ${r.code}",
+                    retryAfterSeconds = parsed.parameters?.retry_after,
+                )
+            } catch (e: Exception) {
+                TelegramSendResult(
+                    ok = r.isSuccessful,
+                    messageId = null,
+                    errorCode = if (r.isSuccessful) null else r.code,
+                    description = if (r.isSuccessful) "json_parse_error: ${e.message}" else "HTTP ${r.code}",
+                    retryAfterSeconds = null,
+                )
+            }
+        }
+    }
+
+    fun copyMessage(
+        chatId: Long,
+        fromChatId: Long,
+        messageId: Int,
+        disableNotification: Boolean? = null,
+    ): TelegramSendResult {
+        val args = mutableMapOf<String, Any>(
+            "chat_id" to chatId,
+            "from_chat_id" to fromChatId,
+            "message_id" to messageId,
+        )
+        if (disableNotification == true) {
+            args["disable_notification"] = true
+        }
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("copyMessage")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            return try {
+                val parsed: TgApiResp<TgMessageId> = mapper.readValue(raw)
                 val success = parsed.ok && r.isSuccessful
                 TelegramSendResult(
                     ok = success,

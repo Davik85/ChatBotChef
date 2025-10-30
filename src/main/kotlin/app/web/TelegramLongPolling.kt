@@ -27,6 +27,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import app.logic.RateLimiter
+import kotlin.random.Random
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -51,12 +52,30 @@ class TelegramLongPolling(
 
     private sealed class AdminState {
         object AwaitingBroadcastText : AdminState()
-        data class AwaitingConfirmation(val text: String) : AdminState()
+        data class AwaitingConfirmation(val draft: BroadcastDraft) : AdminState()
         object AwaitingUserIdForStatus : AdminState()
         object AwaitingGrantParams : AdminState()
     }
 
+    private data class BroadcastDraft(
+        val text: String?,
+        val caption: String?,
+        val entities: List<TgMessageEntity>?,
+        val captionEntities: List<TgMessageEntity>?,
+        val sourceFromChatId: Long?,
+        val sourceMessageId: Int?,
+    ) {
+        val contentLength: Int
+            get() = text?.length ?: caption?.length ?: 0
+    }
+
     private enum class BroadcastResult { SENT, BLOCKED, FAILED }
+
+    private data class BroadcastSendOutcome(
+        val result: BroadcastResult,
+        val errorCode: Int? = null,
+        val description: String? = null,
+    )
 
     private data class AdminStatsSnapshot(
         val total: Long,
@@ -82,7 +101,8 @@ class TelegramLongPolling(
         private const val ADMIN_STATUS_COMMAND_USAGE = "Использование: /premiumstatus <tgId>"
         private const val MAX_BROADCAST_CHARS = 2000
         private const val ACTIVITY_MAX_CHARS = 3800
-        private const val BROADCAST_RATE_DELAY_MS = 250L
+        private const val BROADCAST_RATE_DELAY_MIN_MS = 35L
+        private const val BROADCAST_RATE_DELAY_MAX_MS = 50L
         private const val BROADCAST_BATCH_SIZE = 500
         private const val DAY_MS = 24L * 60L * 60L * 1000L
         private val NON_TEXT_REPLY = "Я работаю только с текстом. Пришлите запрос текстом."
@@ -197,14 +217,8 @@ class TelegramLongPolling(
         return value
     }
 
-    private fun sanitizeAdminInput(raw: String, maxChars: Int = MAX_BROADCAST_CHARS): String {
-        var value = raw.replace("\r", " ").replace("\n", " ")
-        value = CTRL_REGEX.replace(value, "")
-        if (value.length > maxChars) {
-            value = value.take(maxChars)
-        }
-        return value.trim()
-    }
+    private fun normalizeLineBreaks(raw: String): String =
+        raw.replace("\r\n", "\n").replace("\r", "\n")
 
     private fun parseTelegramId(raw: String?): Long? {
         if (raw.isNullOrBlank()) return null
@@ -499,14 +513,15 @@ class TelegramLongPolling(
                 val prepared = adminStates[chatId]
                 if (prepared is AdminState.AwaitingConfirmation) {
                     api.deleteInlineKeyboard(chatId, msgId)
-                    println("ADMIN-AUDIT: action=broadcast_confirm chat=$chatId user=$userId chars=${prepared.text.length}")
+                    val length = prepared.draft.contentLength
+                    println("ADMIN-AUDIT: action=broadcast_confirm chat=$chatId user=$userId chars=$length")
                     AdminAuditRepo.record(
                         adminId = userId,
                         action = "broadcast_confirm",
                         target = chatId.toString(),
-                        meta = "chars=${prepared.text.length}"
+                        meta = "chars=$length"
                     )
-                    startBroadcast(chatId, prepared.text, userId)
+                    startBroadcast(chatId, prepared.draft, userId)
                 } else {
                     api.sendMessage(chatId, "Нет подготовленной рассылки.", parseMode = null)
                 }
@@ -545,6 +560,28 @@ class TelegramLongPolling(
             msg.audio != null ||
             msg.sticker != null ||
             msg.animation != null
+
+        val adminState = adminStates[chatId]
+        if (adminState != null) {
+            if (!isAdmin(userId)) {
+                adminStates.remove(chatId)
+                println("ADMIN-AUDIT: action=state_force_exit chat=$chatId user=$userId reason=non_admin")
+            } else {
+                if (tryHandleAdminStateInput(chatId, userId, msg)) {
+                    return
+                }
+                adminStates.remove(chatId)
+                val stateName = adminState::class.simpleName ?: "unknown"
+                println("ADMIN-AUDIT: action=state_exit chat=$chatId user=$userId state=$stateName reason=unhandled_input")
+                AdminAuditRepo.record(
+                    adminId = userId,
+                    action = "state_exit",
+                    target = chatId.toString(),
+                    meta = "state=$stateName"
+                )
+            }
+        }
+
         if (hasAttachments) {
             api.sendMessage(chatId, NON_TEXT_REPLY)
             return
@@ -573,26 +610,6 @@ class TelegramLongPolling(
                 showAdminMenu(chatId, userId)
             }
             return
-        }
-
-        val adminState = adminStates[chatId]
-        if (adminState != null) {
-            if (!isAdmin(userId)) {
-                adminStates.remove(chatId)
-                println("ADMIN-AUDIT: action=state_force_exit chat=$chatId user=$userId reason=non_admin")
-            } else {
-                if (tryHandleAdminStateInput(chatId, userId, originalText)) {
-                    return
-                }
-                adminStates.remove(chatId)
-                println("ADMIN-AUDIT: action=state_exit chat=$chatId user=$userId state=$adminState reason=unhandled_input")
-                AdminAuditRepo.record(
-                    adminId = userId,
-                    action = "state_exit",
-                    target = chatId.toString(),
-                    meta = "state=$adminState"
-                )
-            }
         }
 
         if (text.isBlank()) return
@@ -665,8 +682,9 @@ class TelegramLongPolling(
         }
     }
 
-    private fun tryHandleAdminStateInput(chatId: Long, adminId: Long, rawInput: String): Boolean {
+    private fun tryHandleAdminStateInput(chatId: Long, adminId: Long, message: TgMessage): Boolean {
         val state = adminStates[chatId] ?: return false
+        val rawInput = message.text ?: message.caption ?: ""
         val trimmed = rawInput.trim()
         val lower = trimmed.lowercase()
         return when (state) {
@@ -680,22 +698,17 @@ class TelegramLongPolling(
                 } else if (trimmed.startsWith("/")) {
                     false
                 } else {
-                    val prepared = validateBroadcastText(chatId, rawInput)
-                    if (prepared != null) {
-                        adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
-                        println("ADMIN-AUDIT: action=broadcast_prepared chat=$chatId user=$adminId chars=${prepared.length}")
+                    val draft = prepareBroadcastDraft(chatId, message)
+                    if (draft != null) {
+                        adminStates[chatId] = AdminState.AwaitingConfirmation(draft)
+                        println("ADMIN-AUDIT: action=broadcast_prepared chat=$chatId user=$adminId chars=${draft.contentLength}")
                         AdminAuditRepo.record(
                             adminId,
                             action = "broadcast_prepared",
                             target = chatId.toString(),
-                            meta = "chars=${prepared.length}"
+                            meta = "chars=${draft.contentLength}"
                         )
-                        api.sendMessage(
-                            chatId,
-                            "Отправить рассылку всем пользователям?\n\n$prepared",
-                            replyMarkup = broadcastConfirmKeyboard(),
-                            parseMode = null
-                        )
+                        showBroadcastPreview(chatId, draft)
                     }
                     true
                 }
@@ -715,22 +728,17 @@ class TelegramLongPolling(
                 } else if (trimmed.startsWith("/")) {
                     false
                 } else {
-                    val prepared = validateBroadcastText(chatId, rawInput)
-                    if (prepared != null) {
-                        adminStates[chatId] = AdminState.AwaitingConfirmation(prepared)
-                        println("ADMIN-AUDIT: action=broadcast_updated chat=$chatId user=$adminId chars=${prepared.length}")
+                    val draft = prepareBroadcastDraft(chatId, message)
+                    if (draft != null) {
+                        adminStates[chatId] = AdminState.AwaitingConfirmation(draft)
+                        println("ADMIN-AUDIT: action=broadcast_updated chat=$chatId user=$adminId chars=${draft.contentLength}")
                         AdminAuditRepo.record(
                             adminId,
                             action = "broadcast_updated",
                             target = chatId.toString(),
-                            meta = "chars=${prepared.length}"
+                            meta = "chars=${draft.contentLength}"
                         )
-                        api.sendMessage(
-                            chatId,
-                            "Отправить рассылку всем пользователям?\n\n$prepared",
-                            replyMarkup = broadcastConfirmKeyboard(),
-                            parseMode = null
-                        )
+                        showBroadcastPreview(chatId, draft)
                     }
                     true
                 }
@@ -999,13 +1007,23 @@ class TelegramLongPolling(
             )
         )
 
-    private fun validateBroadcastText(chatId: Long, rawInput: String): String? {
-        val trimmed = rawInput.trim()
-        if (trimmed.isEmpty()) {
+    private fun prepareBroadcastDraft(chatId: Long, message: TgMessage): BroadcastDraft? {
+        val normalizedText = message.text?.let(::normalizeLineBreaks)
+        val normalizedCaption = message.caption?.let(::normalizeLineBreaks)
+        val hasMedia = (message.photo?.isNotEmpty() == true) ||
+            message.document != null ||
+            message.video != null ||
+            message.video_note != null ||
+            message.voice != null ||
+            message.audio != null ||
+            message.sticker != null ||
+            message.animation != null
+        val hasContent = !normalizedText.isNullOrBlank() || !normalizedCaption.isNullOrBlank()
+        if (!hasContent && !hasMedia) {
             api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
             return null
         }
-        if (trimmed.length > MAX_BROADCAST_CHARS) {
+        if (!normalizedText.isNullOrBlank() && normalizedText.length > MAX_BROADCAST_CHARS) {
             api.sendMessage(
                 chatId,
                 "Текст рассылки превышает ${MAX_BROADCAST_CHARS} символов. Сократите сообщение.",
@@ -1013,12 +1031,47 @@ class TelegramLongPolling(
             )
             return null
         }
-        val sanitized = sanitizeAdminInput(trimmed, MAX_BROADCAST_CHARS)
-        if (sanitized.isEmpty()) {
-            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+        if (!normalizedCaption.isNullOrBlank() && normalizedCaption.length > MAX_BROADCAST_CHARS) {
+            api.sendMessage(
+                chatId,
+                "Подпись рассылки превышает ${MAX_BROADCAST_CHARS} символов. Сократите сообщение.",
+                parseMode = null
+            )
             return null
         }
-        return sanitized
+        return BroadcastDraft(
+            text = normalizedText,
+            caption = normalizedCaption,
+            entities = message.entities,
+            captionEntities = message.caption_entities,
+            sourceFromChatId = message.chat.id,
+            sourceMessageId = message.message_id,
+        )
+    }
+
+    private fun showBroadcastPreview(chatId: Long, draft: BroadcastDraft) {
+        val fromChatId = draft.sourceFromChatId
+        val messageId = draft.sourceMessageId
+        if (fromChatId != null && messageId != null) {
+            val previewResult = runCatching { api.copyMessage(chatId, fromChatId, messageId) }
+                .onFailure {
+                    println("BCAST-PREVIEW-ERR chat=$chatId reason=${it.message}")
+                }
+                .getOrNull()
+            if (previewResult != null && !previewResult.ok) {
+                val code = previewResult.errorCode?.toString() ?: "unknown"
+                val desc = previewResult.description?.replace("\n", " ")?.take(200) ?: "unknown"
+                println("BCAST-PREVIEW-ERR chat=$chatId code=$code reason=$desc")
+            }
+        } else {
+            println("BCAST-PREVIEW-WARN chat=$chatId reason=missing_source_message")
+        }
+        api.sendMessage(
+            chatId,
+            "Отправить рассылку всем пользователям?",
+            replyMarkup = broadcastConfirmKeyboard(),
+            parseMode = null
+        )
     }
 
     private fun handlePremiumStatusLookup(
@@ -1207,40 +1260,15 @@ class TelegramLongPolling(
             }
     }
 
-    private fun splitMessageForBroadcast(text: String): List<String> {
-        val maxLen = 4096
-        if (text.length <= maxLen) return listOf(text)
-        val result = mutableListOf<String>()
-        var start = 0
-        while (start < text.length) {
-            var end = (start + maxLen).coerceAtMost(text.length)
-            if (end < text.length) {
-                var split = text.lastIndexOf('\n', end - 1)
-                if (split < start) {
-                    split = text.lastIndexOf(' ', end - 1)
-                }
-                if (split >= start) {
-                    end = split + 1
-                }
-            }
-            if (end <= start) {
-                end = (start + maxLen).coerceAtMost(text.length)
-            }
-            result += text.substring(start, end)
-            start = end
-        }
-        return result
-    }
-
-    private fun startBroadcast(adminChatId: Long, text: String, adminId: Long) {
+    private fun startBroadcast(adminChatId: Long, draft: BroadcastDraft, adminId: Long) {
         adminStates.remove(adminChatId)
         synchronized(broadcastMutex) {
             val current = broadcastJob
             if (current?.isActive == true) {
                 api.sendMessage(adminChatId, "Рассылка уже выполняется. Дождитесь завершения текущей отправки.", parseMode = null)
-                    return
-                }
-                api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
+                return
+            }
+            api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
             broadcastJob = GlobalScope.launch {
                 try {
                     val context = runCatching { AudienceRepo.createContext(includeBlocked = false) }
@@ -1255,56 +1283,52 @@ class TelegramLongPolling(
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
                     }
-                    val messageChunks = splitMessageForBroadcast(text)
-                    println(
-                        "ADMIN-BROADCAST-START: admin=$adminChatId recipients=$totalRecipients chunks=${messageChunks.size}"
-                    )
+                    println("BCAST-START total=$totalRecipients")
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_start",
                         target = adminChatId.toString(),
-                        meta = "recipients=$totalRecipients chunks=${messageChunks.size}"
+                        meta = "recipients=$totalRecipients"
                     )
-                    var attempts = 0L
                     var sentRecipients = 0L
                     var failedRecipients = 0L
                     var blockedRecipients = 0L
-                    val totalBatches = ((totalRecipients + BROADCAST_BATCH_SIZE - 1) / BROADCAST_BATCH_SIZE).coerceAtLeast(1)
-                    var batchIndex = 0L
                     var offset = 0L
                     while (offset < totalRecipients) {
                         val batch = AudienceRepo.loadPage(context, offset, BROADCAST_BATCH_SIZE)
                         if (batch.isEmpty()) {
                             break
                         }
-                        batchIndex++
                         for (recipient in batch) {
-                            var recipientOutcome = BroadcastResult.SENT
-                            for (chunk in messageChunks) {
-                                attempts++
-                                val result = sendBroadcastChunk(recipient, chunk)
-                                if (result != BroadcastResult.SENT) {
-                                    recipientOutcome = result
+                            val outcome = sendBroadcastToUser(recipient, draft)
+                            when (outcome.result) {
+                                BroadcastResult.SENT -> {
+                                    sentRecipients++
+                                    println("BCAST-SEND ok user=$recipient")
                                 }
-                                delay(BROADCAST_RATE_DELAY_MS)
-                                if (result != BroadcastResult.SENT) {
-                                    break
+                                BroadcastResult.BLOCKED -> {
+                                    blockedRecipients++
+                                    val code = outcome.errorCode?.toString() ?: "403"
+                                    val desc = outcome.description?.replace("\n", " ")?.take(200) ?: "blocked"
+                                    println("BCAST-ERR user=$recipient code=$code reason=$desc")
+                                }
+                                BroadcastResult.FAILED -> {
+                                    failedRecipients++
+                                    val code = outcome.errorCode?.toString() ?: "unknown"
+                                    val desc = outcome.description?.replace("\n", " ")?.take(200) ?: "unknown"
+                                    println("BCAST-ERR user=$recipient code=$code reason=$desc")
                                 }
                             }
-                            when (recipientOutcome) {
-                                BroadcastResult.SENT -> sentRecipients++
-                                BroadcastResult.BLOCKED -> blockedRecipients++
-                                BroadcastResult.FAILED -> failedRecipients++
-                            }
+                            val delayMs = Random.nextLong(
+                                BROADCAST_RATE_DELAY_MIN_MS,
+                                BROADCAST_RATE_DELAY_MAX_MS + 1
+                            )
+                            delay(delayMs)
                         }
                         offset += batch.size
-                        val failedTotal = failedRecipients + blockedRecipients
-                        println(
-                            "ADMIN-BROADCAST: batch=$batchIndex/$totalBatches sent=$sentRecipients failed=$failedTotal total=$totalRecipients"
-                        )
                     }
                     val errors = failedRecipients + blockedRecipients
-                    val summary = "Отправлено: $sentRecipients, ошибок: $errors"
+                    val summary = "Рассылка завершена. ok=$sentRecipients, errors=$errors"
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     AdminAuditRepo.record(
                         adminId = adminId,
@@ -1312,9 +1336,7 @@ class TelegramLongPolling(
                         target = adminChatId.toString(),
                         meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
                     )
-                    println(
-                        "ADMIN-BROADCAST-DONE: admin=$adminChatId recipients=$totalRecipients attempts=$attempts sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
-                    )
+                    println("BCAST-DONE ok=$sentRecipients err=$errors failed=$failedRecipients blocked=$blockedRecipients")
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
                 }
@@ -1335,52 +1357,97 @@ class TelegramLongPolling(
         return normalized.contains("forbidden") && normalized.contains("403")
     }
 
-    private suspend fun sendBroadcastChunk(recipient: Long, chunk: String): BroadcastResult {
+    private suspend fun sendBroadcastToUser(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
+        val copyOutcome = tryCopyBroadcast(recipient, draft)
+        if (copyOutcome != null) {
+            return copyOutcome
+        }
+        return sendBroadcastFallback(recipient, draft)
+    }
+
+    private suspend fun tryCopyBroadcast(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome? {
+        val fromChatId = draft.sourceFromChatId ?: return null
+        val messageId = draft.sourceMessageId ?: return null
         for (attempt in 0 until 5) {
             val outcome = try {
-                api.sendMessageDetailed(recipient, chunk, parseMode = null, maxChars = 4096)
+                api.copyMessage(recipient, fromChatId, messageId)
             } catch (t: Throwable) {
                 val message = t.message
                 if (isBlockedException(message)) {
-                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=forbidden exception=${message ?: "unknown"}")
-                    runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
-                        .onFailure { println("ADMIN-BROADCAST-ERR: mark_blocked_failed user=$recipient reason=${it.message}") }
-                    return BroadcastResult.BLOCKED
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
                 }
-                println("ADMIN-BROADCAST-ERR: user=$recipient reason=${message ?: "unknown"} attempt=${attempt + 1}")
+                println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
                 delay(500)
                 continue
             }
             if (outcome.ok) {
-                return BroadcastResult.SENT
+                return BroadcastSendOutcome(BroadcastResult.SENT)
             }
-            val code = outcome.errorCode?.toString() ?: "unknown"
-            val description = outcome.description?.replace("\n", " ")?.trim().orEmpty()
-            val body = if (description.isEmpty()) "unknown" else description
-            println("TG-HTTP-ERR sendMessage broadcast: code=$code body=$body user=$recipient")
             when {
                 outcome.errorCode == 429 -> {
                     val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
-                    println("ADMIN-BROADCAST-RATE-LIMIT: user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
-                    delay(waitSec * 1000L + 250L)
+                    println("BCAST-RATE-LIMIT user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
+                    delay((waitSec + 1) * 1000L)
                 }
                 isBlockedResponse(outcome.errorCode, outcome.description) -> {
-                    val desc = outcome.description ?: "forbidden"
-                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=forbidden description=$desc")
-                    runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
-                        .onFailure { println("ADMIN-BROADCAST-ERR: mark_blocked_failed user=$recipient reason=${it.message}") }
-                    return BroadcastResult.BLOCKED
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
+                }
+                outcome.errorCode == 400 -> {
+                    return null
                 }
                 else -> {
-                    val code = outcome.errorCode?.toString() ?: "unknown"
-                    val desc = outcome.description ?: "unknown"
-                    println("ADMIN-BROADCAST-ERR: user=$recipient reason=$desc code=$code")
-                    return BroadcastResult.FAILED
+                    return BroadcastSendOutcome(BroadcastResult.FAILED, outcome.errorCode, outcome.description)
                 }
             }
         }
-        println("ADMIN-BROADCAST-ERR: user=$recipient reason=retries_exhausted")
-        return BroadcastResult.FAILED
+        return BroadcastSendOutcome(BroadcastResult.FAILED, 429, "copy_retries_exhausted")
+    }
+
+    private suspend fun sendBroadcastFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
+        val text = draft.text ?: draft.caption
+        if (text.isNullOrBlank()) {
+            return BroadcastSendOutcome(BroadcastResult.FAILED, 400, "fallback_empty")
+        }
+        val entities = if (draft.text != null) draft.entities else draft.captionEntities
+        for (attempt in 0 until 5) {
+            val outcome = try {
+                api.sendMessageDetailed(recipient, text, parseMode = null, maxChars = 4096, entities = entities)
+            } catch (t: Throwable) {
+                val message = t.message
+                if (isBlockedException(message)) {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
+                }
+                println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
+                delay(500)
+                continue
+            }
+            if (outcome.ok) {
+                return BroadcastSendOutcome(BroadcastResult.SENT)
+            }
+            when {
+                outcome.errorCode == 429 -> {
+                    val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
+                    println("BCAST-RATE-LIMIT user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
+                    delay((waitSec + 1) * 1000L)
+                }
+                isBlockedResponse(outcome.errorCode, outcome.description) -> {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
+                }
+                else -> {
+                    return BroadcastSendOutcome(BroadcastResult.FAILED, outcome.errorCode, outcome.description)
+                }
+            }
+        }
+        return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "fallback_retries_exhausted")
+    }
+
+    private fun markRecipientBlocked(recipient: Long) {
+        runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
+            .onFailure { println("BCAST-ERR mark_blocked_failed user=$recipient reason=${it.message}") }
     }
 
     private fun sendAdminStats(chatId: Long) {
