@@ -215,6 +215,101 @@ class TelegramLongPolling(
         return value.trim()
     }
 
+    private enum class ReplyChunkBreak { DOUBLE_NEWLINE, SINGLE_NEWLINE, SPACE, HARD }
+
+    private data class ReplyChunkBoundary(val endExclusive: Int, val kind: ReplyChunkBreak)
+
+    private fun sendLongReply(chatId: Long, text: String) {
+        val limit = AppConfig.MAX_REPLY_CHARS.coerceAtLeast(1)
+        if (text.length <= limit) {
+            api.sendMessage(chatId, text)
+            return
+        }
+        val chunks = splitReplyIntoChunks(text, limit)
+        if (chunks.isEmpty()) {
+            api.sendMessage(chatId, text)
+            return
+        }
+        chunks.forEach { part ->
+            if (part.isNotEmpty()) {
+                api.sendMessage(chatId, part)
+            }
+        }
+    }
+
+    private fun splitReplyIntoChunks(text: String, limit: Int): List<String> {
+        if (text.isEmpty()) return listOf("")
+        val safeLimit = limit.coerceAtLeast(1)
+        if (text.length <= safeLimit) return listOf(text)
+        val result = mutableListOf<String>()
+        var remaining = text
+        while (remaining.isNotEmpty()) {
+            if (remaining.length <= safeLimit) {
+                result += remaining
+                break
+            }
+            val slice = remaining.substring(0, safeLimit)
+            var boundary = findReplyChunkBoundary(slice)
+            var cut = boundary.endExclusive
+            if (cut <= 0 || cut > slice.length) {
+                cut = slice.length
+                boundary = ReplyChunkBoundary(slice.length, ReplyChunkBreak.HARD)
+            }
+            val adjusted = adjustMarkdownBoundary(slice, cut)
+            if (adjusted != cut) {
+                cut = adjusted
+                boundary = ReplyChunkBoundary(cut, ReplyChunkBreak.HARD)
+            }
+            if (cut <= 0) {
+                cut = slice.length
+                boundary = ReplyChunkBoundary(slice.length, ReplyChunkBreak.HARD)
+            }
+            val rawPart = remaining.substring(0, cut)
+            val part = when (boundary.kind) {
+                ReplyChunkBreak.SPACE -> rawPart.trimEnd { it == ' ' }.ifEmpty { rawPart }
+                else -> rawPart
+            }
+            result += part
+            remaining = remaining.substring(cut)
+            if (remaining.isEmpty()) break
+            if (boundary.kind == ReplyChunkBreak.SPACE) {
+                remaining = remaining.trimStart { it == ' ' }
+            }
+        }
+        return result
+    }
+
+    private fun findReplyChunkBoundary(slice: String): ReplyChunkBoundary {
+        val doubleNewline = slice.lastIndexOf("\n\n")
+        if (doubleNewline >= 0) {
+            return ReplyChunkBoundary(doubleNewline + 2, ReplyChunkBreak.DOUBLE_NEWLINE)
+        }
+        val singleNewline = slice.lastIndexOf('\n')
+        if (singleNewline >= 0) {
+            return ReplyChunkBoundary(singleNewline + 1, ReplyChunkBreak.SINGLE_NEWLINE)
+        }
+        val space = slice.lastIndexOf(' ')
+        if (space >= 0) {
+            return ReplyChunkBoundary(space + 1, ReplyChunkBreak.SPACE)
+        }
+        return ReplyChunkBoundary(slice.length, ReplyChunkBreak.HARD)
+    }
+
+    private fun adjustMarkdownBoundary(slice: String, proposed: Int): Int {
+        if (proposed <= 0 || proposed >= slice.length) return proposed
+        var cut = proposed
+        while (cut > 0) {
+            val ch = slice[cut - 1]
+            val unsafe = ch == '*' || ch == '_' || ch == '`' || ch == '[' || ch == '(' || ch == '!'
+            if (!unsafe) break
+            cut--
+        }
+        if (cut > 0 && slice[cut - 1] == '\\') {
+            cut--
+        }
+        return if (cut <= 0) proposed else cut
+    }
+
     private fun sanitizeActivityText(raw: String): String? {
         var value = raw.replace("\r", " ").replace("\n", " ")
         value = CTRL_REGEX.replace(value, "")
@@ -1021,7 +1116,7 @@ class TelegramLongPolling(
         messages.addAll(history)
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
-        api.sendMessage(chatId, reply)
+        sendLongReply(chatId, reply)
         RateLimiter.consumeIfFree(userId, isAdminUser)
 
         if (preparedUser.isNotEmpty()) {
@@ -1048,7 +1143,7 @@ class TelegramLongPolling(
         messages.addAll(history)
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
-        api.sendMessage(chatId, reply)
+        sendLongReply(chatId, reply)
         RateLimiter.consumeIfFree(userId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
@@ -1075,7 +1170,7 @@ class TelegramLongPolling(
         messages.addAll(history)
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
-        api.sendMessage(chatId, reply)
+        sendLongReply(chatId, reply)
         RateLimiter.consumeIfFree(userId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
