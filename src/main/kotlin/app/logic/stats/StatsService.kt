@@ -21,16 +21,18 @@ object StatsService {
 
     fun collect(now: Long = System.currentTimeMillis()): Snapshot {
         val threshold = activeInstallThreshold(now)
-        val total = UsersRepo.countUsers(includeBlocked = true)
-        val blocked = UsersRepo.countBlocked().coerceAtMost(total)
-        val activeInstalls = UsersRepo.countActiveInstalls(threshold).coerceAtMost(total)
+        val userSummary = UsersRepo.summarizeForStats(threshold)
+        val total = userSummary.totalUsers
+        val blocked = userSummary.blockedUsers.coerceAtMost(total)
+        val activeInstalls = userSummary.activeUsers.coerceAtMost(total)
         val premium = PremiumRepo.countActive(now)
         val active7dThreshold = now - 7 * DAY_MS
         val active7d = MessagesRepo.countActiveSince(active7dThreshold).coerceAtLeast(0L)
         println(
             "ADMIN-STATS-DBG: users_total=$total users_blocked=$blocked " +
                 "users_active_window=$activeInstalls window_from=$threshold " +
-                "premium_active=$premium users_active7d=$active7d"
+                "premium_active=$premium users_active7d=$active7d " +
+                "sources=${userSummary.sourcesUsed} active_window_candidates=${userSummary.activeWindowPopulation}"
         )
         return Snapshot(
             total = total,
@@ -43,7 +45,9 @@ object StatsService {
 
     /**
      * Срезы статистики строятся на базе текущей схемы БД:
-     * - таблица users даёт total/blocked и activeInstalls (последние считаются по last_seen в окне $ACTIVE_INSTALL_WINDOW_DAYS дней);
+     * - UsersRepo.summarizeForStats() собирает пользователей из users/messages/chat_history/premium_* и usage_counters,
+     *   чтобы total/blocked/activeInstalls оставались корректными даже если users ещё не успела наполниться
+     *   или содержит легаси-записи.
      * - активные за 7 дней считаются по таблице messages, чтобы совпасть с ADMIN-STATUS;
      * - количество премиум-пользователей берётся из таблицы premium_users через PremiumRepo.
      */
