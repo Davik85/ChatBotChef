@@ -1,7 +1,7 @@
 package app.notify
 
 import app.db.PremiumRepo
-import app.web.TelegramApi
+import app.telegram.TelegramApi
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive

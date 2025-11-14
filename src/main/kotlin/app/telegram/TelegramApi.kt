@@ -1,8 +1,8 @@
-package app.web
+package app.telegram
 
 import app.AppConfig
 import app.db.UsersRepo
-import app.web.dto.*
+import app.telegram.dto.*
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import okhttp3.MediaType.Companion.toMediaType

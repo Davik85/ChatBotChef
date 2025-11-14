@@ -4,8 +4,8 @@ import app.AppConfig
 import app.db.PaymentRepo
 import app.db.PaymentRepo.PaymentRecord
 import app.db.PaymentRepo.Status
-import app.web.dto.TgPreCheckoutQuery
-import app.web.dto.TgSuccessfulPayment
+import app.telegram.dto.TgPreCheckoutQuery
+import app.telegram.dto.TgSuccessfulPayment
 
 object PaymentService {
     private const val SUPPORTED_CURRENCY = "RUB"

@@ -1,4 +1,4 @@
-package app.web.dto
+package app.telegram.dto
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 
