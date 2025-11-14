@@ -39,14 +39,9 @@ object UsersRepo {
             it[Users.blocked] = false
         }
         if (inserted.insertedCount > 0) return@transaction true
-        val updatedFirstSeen = Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
+        Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
             it[Users.first_seen] = now
         } > 0
-        Users.update({ Users.user_id eq userId }) {
-            it[Users.blocked_ts] = 0L
-            it[Users.blocked] = false
-        }
-        updatedFirstSeen
     }
 
     fun getAllUserIds(includeBlocked: Boolean = false): List<Long> = transaction {
@@ -128,6 +123,17 @@ object UsersRepo {
 
     fun markBlocked(userId: Long, blocked: Boolean, now: Long = System.currentTimeMillis()): Boolean = transaction {
         val value = if (blocked) now else 0L
+
+        val inserted = Users.insertIgnore {
+            it[Users.user_id] = userId
+            it[Users.first_seen] = now
+            it[Users.blocked_ts] = value
+            it[Users.blocked] = blocked
+        }
+        if (inserted.insertedCount > 0) {
+            return@transaction true
+        }
+
         val existing = Users
             .slice(Users.blocked, Users.blocked_ts)
             .select { Users.user_id eq userId }
