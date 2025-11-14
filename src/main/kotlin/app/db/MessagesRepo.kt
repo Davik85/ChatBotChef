@@ -1,14 +1,15 @@
 package app.db
 
+import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.countDistinct
 
 object MessagesRepo {
     private const val MAX_STORED_TEXT = 4000
@@ -53,11 +54,14 @@ object MessagesRepo {
                 ?: 0L
         } else {
             Messages
-                .innerJoin(Users)
+                .join(
+                    Users,
+                    joinType = JoinType.INNER,
+                    additionalConstraint = { Messages.user_id eq Users.user_id }
+                )
                 .slice(countExpr)
                 .select {
-                    baseCondition and (Messages.user_id eq Users.user_id) and
-                        (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
+                    baseCondition and (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
                 }
                 .firstOrNull()
                 ?.get(countExpr)
