@@ -79,10 +79,10 @@ class TelegramApi(private val token: String) {
             val raw = r.body?.string().orEmpty()
             if (!r.isSuccessful) {
                 val sanitized = sanitizeBody(raw)
-                println("TG-HTTP-ERR getUpdates: code=${r.code} body=$sanitized")
                 if (r.code == 409) {
                     throw TelegramPollingConflictException(r.code, sanitized)
                 }
+                println("TG-HTTP-ERR getUpdates: code=${r.code} body=$sanitized")
                 return emptyList()
             }
             return try {
