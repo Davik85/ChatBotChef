@@ -128,7 +128,17 @@ object UsersRepo {
         )
     }
 
-    fun markBlocked(userId: Long, blocked: Boolean, now: Long = System.currentTimeMillis()): Boolean = transaction {
+    data class MarkBlockedResult(
+        val changed: Boolean,
+        val previousBlocked: Boolean,
+        val currentBlocked: Boolean,
+    )
+
+    fun markBlocked(
+        userId: Long,
+        blocked: Boolean,
+        now: Long = System.currentTimeMillis()
+    ): MarkBlockedResult = transaction {
         val value = if (blocked) now else 0L
 
         val inserted = Users.insertIgnore {
@@ -138,7 +148,11 @@ object UsersRepo {
             it[Users.blocked] = blocked
         }
         if (inserted.insertedCount > 0) {
-            return@transaction true
+            return@transaction MarkBlockedResult(
+                changed = blocked,
+                previousBlocked = false,
+                currentBlocked = blocked,
+            )
         }
 
         val existing = Users
@@ -146,21 +160,37 @@ object UsersRepo {
             .select { Users.user_id eq userId }
             .limit(1)
             .firstOrNull()
-            ?: return@transaction false
+            ?: return@transaction MarkBlockedResult(
+                changed = false,
+                previousBlocked = false,
+                currentBlocked = blocked,
+            )
 
-        val currentBlocked = existing[Users.blocked]
-        val currentBlockedTs = existing[Users.blocked_ts]
+        val normalizedBlockedTs = normalizeBlockedTimestamp(existing[Users.blocked_ts])
+        val currentBlocked = isRowBlocked(existing[Users.blocked], normalizedBlockedTs)
         val shouldUpdate = when {
-            blocked -> !currentBlocked || currentBlockedTs != value
-            else -> currentBlocked || currentBlockedTs != 0L
+            blocked -> !currentBlocked || normalizedBlockedTs != value
+            else -> currentBlocked || normalizedBlockedTs != 0L
         }
 
-        if (!shouldUpdate) return@transaction false
+        if (!shouldUpdate) {
+            return@transaction MarkBlockedResult(
+                changed = false,
+                previousBlocked = currentBlocked,
+                currentBlocked = currentBlocked,
+            )
+        }
 
         Users.update({ Users.user_id eq userId }) { row ->
             row[Users.blocked_ts] = value
             row[Users.blocked] = blocked
-        } > 0
+        }
+
+        MarkBlockedResult(
+            changed = true,
+            previousBlocked = currentBlocked,
+            currentBlocked = blocked,
+        )
     }
 
     fun repairOrphans(source: String? = null, now: Long = System.currentTimeMillis()): Long {
