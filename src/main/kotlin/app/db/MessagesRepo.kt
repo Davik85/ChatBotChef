@@ -4,7 +4,6 @@ import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insert
@@ -57,11 +56,12 @@ object MessagesRepo {
                 .join(
                     Users,
                     joinType = JoinType.INNER,
-                    additionalConstraint = { Messages.user_id eq Users.user_id }
+                    onColumn = Messages.user_id,
+                    otherColumn = Users.user_id
                 )
                 .slice(countExpr)
                 .select {
-                    baseCondition and (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
+                    baseCondition and (Users.blocked eq false)
                 }
                 .firstOrNull()
                 ?.get(countExpr)
