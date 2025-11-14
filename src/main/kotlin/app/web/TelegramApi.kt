@@ -21,6 +21,11 @@ data class TelegramSendResult(
     val retryAfterSeconds: Int? = null,
 )
 
+class TelegramPollingConflictException(
+    val statusCode: Int,
+    val body: String
+) : RuntimeException("Telegram getUpdates conflict: HTTP $statusCode")
+
 class TelegramApi(private val token: String) {
     private val mapper = jacksonObjectMapper()
     private val client = OkHttpClient.Builder()
@@ -73,7 +78,11 @@ class TelegramApi(private val token: String) {
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
             if (!r.isSuccessful) {
-                println("TG-HTTP-ERR getUpdates: code=${r.code} body=${sanitizeBody(raw)}")
+                val sanitized = sanitizeBody(raw)
+                println("TG-HTTP-ERR getUpdates: code=${r.code} body=$sanitized")
+                if (r.code == 409) {
+                    throw TelegramPollingConflictException(r.code, sanitized)
+                }
                 return emptyList()
             }
             return try {

@@ -322,7 +322,15 @@ class TelegramLongPolling(
 
         while (true) {
             try {
-                val updates: List<TgUpdate> = api.getUpdates(offset)
+                val updates: List<TgUpdate> = try {
+                    api.getUpdates(offset)
+                } catch (conflict: TelegramPollingConflictException) {
+                    println(
+                        "TG-POLL-CONFLICT: code=${conflict.statusCode} body=${conflict.body}"
+                    )
+                    delay(5000)
+                    continue
+                }
                 if (updates.isEmpty()) { delay(1200); continue }
 
                 for (u in updates) {
@@ -384,7 +392,8 @@ class TelegramLongPolling(
                     }
                 }
             } catch (t: Throwable) {
-                println("TG-POLL-ERR: ${t.message}")
+                val type = t::class.simpleName ?: "Throwable"
+                println("TG-POLL-ERR: $type:${t.message}")
                 delay(1500)
             }
         }
