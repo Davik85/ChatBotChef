@@ -57,11 +57,19 @@ class TelegramLongPolling(
         object AwaitingGrantParams : AdminState()
     }
 
+    private enum class BroadcastContentType(val displayName: String) {
+        TEXT("текст"),
+        PHOTO("фото"),
+        VIDEO("видео")
+    }
+
     private data class BroadcastDraft(
+        val type: BroadcastContentType,
         val text: String?,
         val caption: String?,
         val entities: List<TgMessageEntity>?,
         val captionEntities: List<TgMessageEntity>?,
+        val mediaFileId: String?,
         val sourceFromChatId: Long?,
         val sourceMessageId: Int?,
     ) {
@@ -561,7 +569,11 @@ class TelegramLongPolling(
                 println("ADMIN-AUDIT: action=broadcast_prompt chat=$chatId user=$userId source=menu")
                 AdminAuditRepo.record(userId, action = "broadcast_prompt", target = chatId.toString(), meta = "source=menu")
                 adminStates[chatId] = AdminState.AwaitingBroadcastText
-                api.sendMessage(chatId, "Пришлите текст рассылки одним сообщением.", parseMode = null)
+                api.sendMessage(
+                    chatId,
+                    "Пришлите сообщение для рассылки одним сообщением: текст или текст с одним фото/видео.",
+                    parseMode = null
+                )
             }
             CB_ADMIN_STATS -> {
                 api.answerCallback(cb.id)
@@ -609,12 +621,13 @@ class TelegramLongPolling(
                 if (prepared is AdminState.AwaitingConfirmation) {
                     api.deleteInlineKeyboard(chatId, msgId)
                     val length = prepared.draft.contentLength
-                    println("ADMIN-AUDIT: action=broadcast_confirm chat=$chatId user=$userId chars=$length")
+                    val type = prepared.draft.type.name
+                    println("ADMIN-AUDIT: action=broadcast_confirm chat=$chatId user=$userId chars=$length type=$type")
                     AdminAuditRepo.record(
                         adminId = userId,
                         action = "broadcast_confirm",
                         target = chatId.toString(),
-                        meta = "chars=$length"
+                        meta = "chars=$length type=$type"
                     )
                     startBroadcast(chatId, prepared.draft, userId)
                 } else {
@@ -797,12 +810,16 @@ class TelegramLongPolling(
                     val draft = prepareBroadcastDraft(chatId, message)
                     if (draft != null) {
                         adminStates[chatId] = AdminState.AwaitingConfirmation(draft)
-                        println("ADMIN-AUDIT: action=broadcast_prepared chat=$chatId user=$adminId chars=${draft.contentLength}")
+                        val type = draft.type.name
+                        println(
+                            "ADMIN-AUDIT: action=broadcast_prepared chat=$chatId user=$adminId " +
+                                "chars=${draft.contentLength} type=$type"
+                        )
                         AdminAuditRepo.record(
                             adminId,
                             action = "broadcast_prepared",
                             target = chatId.toString(),
-                            meta = "chars=${draft.contentLength}"
+                            meta = "chars=${draft.contentLength} type=$type"
                         )
                         showBroadcastPreview(chatId, draft)
                     }
@@ -827,12 +844,16 @@ class TelegramLongPolling(
                     val draft = prepareBroadcastDraft(chatId, message)
                     if (draft != null) {
                         adminStates[chatId] = AdminState.AwaitingConfirmation(draft)
-                        println("ADMIN-AUDIT: action=broadcast_updated chat=$chatId user=$adminId chars=${draft.contentLength}")
+                        val type = draft.type.name
+                        println(
+                            "ADMIN-AUDIT: action=broadcast_updated chat=$chatId user=$adminId " +
+                                "chars=${draft.contentLength} type=$type"
+                        )
                         AdminAuditRepo.record(
                             adminId,
                             action = "broadcast_updated",
                             target = chatId.toString(),
-                            meta = "chars=${draft.contentLength}"
+                            meta = "chars=${draft.contentLength} type=$type"
                         )
                         showBroadcastPreview(chatId, draft)
                     }
@@ -1106,19 +1127,40 @@ class TelegramLongPolling(
     private fun prepareBroadcastDraft(chatId: Long, message: TgMessage): BroadcastDraft? {
         val normalizedText = message.text?.let(::normalizeLineBreaks)
         val normalizedCaption = message.caption?.let(::normalizeLineBreaks)
-        val hasMedia = (message.photo?.isNotEmpty() == true) ||
-            message.document != null ||
-            message.video != null ||
-            message.video_note != null ||
-            message.voice != null ||
-            message.audio != null ||
-            message.sticker != null ||
-            message.animation != null
-        val hasContent = !normalizedText.isNullOrBlank() || !normalizedCaption.isNullOrBlank()
-        if (!hasContent && !hasMedia) {
-            api.sendMessage(chatId, "Текст рассылки не может быть пустым.", parseMode = null)
+        val hasTextContent = !normalizedText.isNullOrBlank()
+        val hasCaptionContent = !normalizedCaption.isNullOrBlank()
+        val hasAnyTextContent = hasTextContent || hasCaptionContent
+
+        val hasPhoto = message.photo?.isNotEmpty() == true
+        val hasVideo = message.video != null
+        val unsupportedMediaPresent = listOf(
+            message.document,
+            message.video_note,
+            message.voice,
+            message.audio,
+            message.sticker,
+            message.animation
+        ).any { it != null }
+
+        if (unsupportedMediaPresent) {
+            api.sendMessage(
+                chatId,
+                "Поддерживаются только текстовые сообщения, а также одно фото или одно видео с подписью.",
+                parseMode = null
+            )
             return null
         }
+
+        if (hasPhoto && hasVideo) {
+            api.sendMessage(chatId, "Можно отправить только один тип медиа: фото или видео.", parseMode = null)
+            return null
+        }
+
+        if (!hasAnyTextContent && !hasPhoto && !hasVideo) {
+            api.sendMessage(chatId, "Сообщение рассылки не может быть пустым.", parseMode = null)
+            return null
+        }
+
         if (!normalizedText.isNullOrBlank() && normalizedText.length > MAX_BROADCAST_CHARS) {
             api.sendMessage(
                 chatId,
@@ -1135,11 +1177,34 @@ class TelegramLongPolling(
             )
             return null
         }
+
+        val (type, mediaFileId) = when {
+            hasPhoto -> BroadcastContentType.PHOTO to message.photo?.let { sizes ->
+                val largest = sizes.maxByOrNull { it.file_size ?: ((it.width ?: 0) * (it.height ?: 0)) }
+                    ?: sizes.lastOrNull()
+                largest?.file_id
+            }
+
+            hasVideo -> BroadcastContentType.VIDEO to message.video?.file_id
+            else -> BroadcastContentType.TEXT to null
+        }
+
+        if ((type == BroadcastContentType.PHOTO || type == BroadcastContentType.VIDEO) && mediaFileId.isNullOrBlank()) {
+            api.sendMessage(
+                chatId,
+                "Не удалось обработать медиа. Попробуйте отправить сообщение ещё раз.",
+                parseMode = null
+            )
+            return null
+        }
+
         return BroadcastDraft(
+            type = type,
             text = normalizedText,
             caption = normalizedCaption,
             entities = message.entities,
             captionEntities = message.caption_entities,
+            mediaFileId = mediaFileId,
             sourceFromChatId = message.chat.id,
             sourceMessageId = message.message_id,
         )
@@ -1357,6 +1422,7 @@ class TelegramLongPolling(
     }
 
     private fun startBroadcast(adminChatId: Long, draft: BroadcastDraft, adminId: Long) {
+        val broadcastType = draft.type
         adminStates.remove(adminChatId)
         synchronized(broadcastMutex) {
             val current = broadcastJob
@@ -1364,7 +1430,11 @@ class TelegramLongPolling(
                 api.sendMessage(adminChatId, "Рассылка уже выполняется. Дождитесь завершения текущей отправки.", parseMode = null)
                 return
             }
-            api.sendMessage(adminChatId, "Рассылка запущена. Это может занять немного времени…", parseMode = null)
+            api.sendMessage(
+                adminChatId,
+                "Рассылка запущена (тип: ${broadcastType.displayName}). Это может занять немного времени…",
+                parseMode = null
+            )
             broadcastJob = GlobalScope.launch {
                 try {
                     val context = runCatching { AudienceRepo.createContext(includeBlocked = false) }
@@ -1379,12 +1449,12 @@ class TelegramLongPolling(
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
                     }
-                    println("BCAST-START total=$totalRecipients")
+                    println("BCAST-START total=$totalRecipients type=${broadcastType.name}")
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_start",
                         target = adminChatId.toString(),
-                        meta = "recipients=$totalRecipients"
+                        meta = "recipients=$totalRecipients type=${broadcastType.name}"
                     )
                     var sentRecipients = 0L
                     var failedRecipients = 0L
@@ -1424,15 +1494,18 @@ class TelegramLongPolling(
                         offset += batch.size
                     }
                     val errors = failedRecipients + blockedRecipients
-                    val summary = "Рассылка завершена. ok=$sentRecipients, errors=$errors"
+                    val summary = "Рассылка завершена (тип: ${broadcastType.displayName}). ok=$sentRecipients, errors=$errors"
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_done",
                         target = adminChatId.toString(),
-                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients"
+                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients type=${broadcastType.name}"
                     )
-                    println("BCAST-DONE ok=$sentRecipients err=$errors failed=$failedRecipients blocked=$blockedRecipients")
+                    println(
+                        "BCAST-DONE type=${broadcastType.name} ok=$sentRecipients err=$errors " +
+                            "failed=$failedRecipients blocked=$blockedRecipients"
+                    )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
                 }
@@ -1501,10 +1574,17 @@ class TelegramLongPolling(
         return BroadcastSendOutcome(BroadcastResult.FAILED, 429, "copy_retries_exhausted")
     }
 
-    private suspend fun sendBroadcastFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
+    private suspend fun sendBroadcastFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome =
+        when (draft.type) {
+            BroadcastContentType.TEXT -> sendTextFallback(recipient, draft)
+            BroadcastContentType.PHOTO -> sendPhotoFallback(recipient, draft)
+            BroadcastContentType.VIDEO -> sendVideoFallback(recipient, draft)
+        }
+
+    private suspend fun sendTextFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
         val text = draft.text ?: draft.caption
         if (text.isNullOrBlank()) {
-            return BroadcastSendOutcome(BroadcastResult.FAILED, 400, "fallback_empty")
+            return BroadcastSendOutcome(BroadcastResult.FAILED, 400, "text_fallback_empty")
         }
         val entities = if (draft.text != null) draft.entities else draft.captionEntities
         for (attempt in 0 until 5) {
@@ -1538,7 +1618,85 @@ class TelegramLongPolling(
                 }
             }
         }
-        return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "fallback_retries_exhausted")
+        return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "text_fallback_retries_exhausted")
+    }
+
+    private suspend fun sendPhotoFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
+        val fileId = draft.mediaFileId
+        if (fileId.isNullOrBlank()) {
+            return BroadcastSendOutcome(BroadcastResult.FAILED, 400, "photo_missing_file_id")
+        }
+        for (attempt in 0 until 5) {
+            val outcome = try {
+                api.sendPhotoByFileId(recipient, fileId, draft.caption, draft.captionEntities)
+            } catch (t: Throwable) {
+                val message = t.message
+                if (isBlockedException(message)) {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
+                }
+                println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
+                delay(500)
+                continue
+            }
+            if (outcome.ok) {
+                return BroadcastSendOutcome(BroadcastResult.SENT)
+            }
+            when {
+                outcome.errorCode == 429 -> {
+                    val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
+                    println("BCAST-RATE-LIMIT user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
+                    delay((waitSec + 1) * 1000L)
+                }
+                isBlockedResponse(outcome.errorCode, outcome.description) -> {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
+                }
+                else -> {
+                    return BroadcastSendOutcome(BroadcastResult.FAILED, outcome.errorCode, outcome.description)
+                }
+            }
+        }
+        return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "photo_fallback_retries_exhausted")
+    }
+
+    private suspend fun sendVideoFallback(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
+        val fileId = draft.mediaFileId
+        if (fileId.isNullOrBlank()) {
+            return BroadcastSendOutcome(BroadcastResult.FAILED, 400, "video_missing_file_id")
+        }
+        for (attempt in 0 until 5) {
+            val outcome = try {
+                api.sendVideoByFileId(recipient, fileId, draft.caption, draft.captionEntities)
+            } catch (t: Throwable) {
+                val message = t.message
+                if (isBlockedException(message)) {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
+                }
+                println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
+                delay(500)
+                continue
+            }
+            if (outcome.ok) {
+                return BroadcastSendOutcome(BroadcastResult.SENT)
+            }
+            when {
+                outcome.errorCode == 429 -> {
+                    val waitSec = (outcome.retryAfterSeconds ?: 1).coerceAtLeast(1)
+                    println("BCAST-RATE-LIMIT user=$recipient wait=${waitSec}s attempt=${attempt + 1}")
+                    delay((waitSec + 1) * 1000L)
+                }
+                isBlockedResponse(outcome.errorCode, outcome.description) -> {
+                    markRecipientBlocked(recipient)
+                    return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
+                }
+                else -> {
+                    return BroadcastSendOutcome(BroadcastResult.FAILED, outcome.errorCode, outcome.description)
+                }
+            }
+        }
+        return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "video_fallback_retries_exhausted")
     }
 
     private fun markRecipientBlocked(recipient: Long) {

@@ -150,6 +150,98 @@ class TelegramApi(private val token: String) {
         }
     }
 
+    fun sendPhotoByFileId(
+        chatId: Long,
+        fileId: String,
+        caption: String? = null,
+        captionEntities: List<TgMessageEntity>? = null,
+        disableNotification: Boolean? = null,
+    ): TelegramSendResult {
+        val args = mutableMapOf<String, Any>(
+            "chat_id" to chatId,
+            "photo" to fileId,
+        )
+        if (!caption.isNullOrEmpty()) {
+            args["caption"] = caption
+        }
+        if (captionEntities != null) {
+            args["caption_entities"] = captionEntities
+        }
+        if (disableNotification == true) {
+            args["disable_notification"] = true
+        }
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("sendPhoto")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            return try {
+                val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                val success = parsed.ok && r.isSuccessful
+                TelegramSendResult(
+                    ok = success,
+                    messageId = parsed.result?.message_id,
+                    errorCode = if (success) null else parsed.error_code ?: r.code,
+                    description = parsed.description ?: if (r.isSuccessful) null else "HTTP ${r.code}",
+                    retryAfterSeconds = parsed.parameters?.retry_after,
+                )
+            } catch (e: Exception) {
+                TelegramSendResult(
+                    ok = r.isSuccessful,
+                    messageId = null,
+                    errorCode = if (r.isSuccessful) null else r.code,
+                    description = if (r.isSuccessful) "json_parse_error: ${e.message}" else "HTTP ${r.code}",
+                    retryAfterSeconds = null,
+                )
+            }
+        }
+    }
+
+    fun sendVideoByFileId(
+        chatId: Long,
+        fileId: String,
+        caption: String? = null,
+        captionEntities: List<TgMessageEntity>? = null,
+        disableNotification: Boolean? = null,
+    ): TelegramSendResult {
+        val args = mutableMapOf<String, Any>(
+            "chat_id" to chatId,
+            "video" to fileId,
+        )
+        if (!caption.isNullOrEmpty()) {
+            args["caption"] = caption
+        }
+        if (captionEntities != null) {
+            args["caption_entities"] = captionEntities
+        }
+        if (disableNotification == true) {
+            args["disable_notification"] = true
+        }
+        val body = mapper.writeValueAsString(args).toRequestBody(json)
+        val req = Request.Builder().url(url("sendVideo")).post(body).build()
+        client.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            return try {
+                val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                val success = parsed.ok && r.isSuccessful
+                TelegramSendResult(
+                    ok = success,
+                    messageId = parsed.result?.message_id,
+                    errorCode = if (success) null else parsed.error_code ?: r.code,
+                    description = parsed.description ?: if (r.isSuccessful) null else "HTTP ${r.code}",
+                    retryAfterSeconds = parsed.parameters?.retry_after,
+                )
+            } catch (e: Exception) {
+                TelegramSendResult(
+                    ok = r.isSuccessful,
+                    messageId = null,
+                    errorCode = if (r.isSuccessful) null else r.code,
+                    description = if (r.isSuccessful) "json_parse_error: ${e.message}" else "HTTP ${r.code}",
+                    retryAfterSeconds = null,
+                )
+            }
+        }
+    }
+
     fun copyMessage(
         chatId: Long,
         fromChatId: Long,
