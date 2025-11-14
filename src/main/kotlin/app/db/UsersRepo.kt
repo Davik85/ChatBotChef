@@ -9,6 +9,7 @@ import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
+import org.jetbrains.exposed.sql.statements.StatementType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
@@ -270,7 +271,7 @@ object UsersRepo {
             FROM aggregated
         """.trimIndent()
 
-        val summary = exec(sql) { rs ->
+        val summary = exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
             if (rs?.next() == true) {
                 StatsSummary(
                     totalUsers = rs.getLongOrZero("total"),
@@ -753,14 +754,20 @@ object UsersRepo {
     }
 
     private fun Transaction.tableExists(name: String): Boolean =
-        exec("SELECT name FROM sqlite_master WHERE type='table' AND name='$name'") { rs ->
+        exec(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='$name'",
+            explicitStatementType = StatementType.SELECT
+        ) { rs ->
             var found = false
             while (rs?.next() == true) found = true
             found
         } ?: false
 
     private fun Transaction.columnExists(table: String, column: String): Boolean =
-        exec("PRAGMA table_info($table)") { rs ->
+        exec(
+            "PRAGMA table_info($table)",
+            explicitStatementType = StatementType.SELECT
+        ) { rs ->
             var ok = false
             while (rs?.next() == true) {
                 if (rs.getString("name") == column) {
