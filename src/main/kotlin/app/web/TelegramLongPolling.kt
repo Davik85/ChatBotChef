@@ -2,7 +2,6 @@ package app.web
 
 import app.AppConfig
 import app.db.AdminAuditRepo
-import app.db.AudienceRepo
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
@@ -14,6 +13,7 @@ import app.llm.dto.ChatMessage
 import app.logic.CalorieCalculatorPrompt
 import app.logic.PersonaPrompt
 import app.logic.ProductInfoPrompt
+import app.logic.RateLimiter
 import app.pay.PaymentService
 import app.pay.ReceiptBuilder
 import app.notify.ReminderJob
@@ -26,7 +26,6 @@ import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import app.logic.RateLimiter
 import kotlin.random.Random
 import java.time.Instant
 import java.time.ZoneId
@@ -85,19 +84,18 @@ class TelegramLongPolling(
         val description: String? = null,
     )
 
+    private data class BroadcastAudience(
+        val totalUsers: Long,
+        val activeUsers: Long,
+        val blockedUsers: Long,
+    )
+
     private data class AdminStatsSnapshot(
         val total: Long,
         val activeInstalls: Long,
         val blocked: Long,
         val premium: Long,
         val active7d: Long,
-    )
-
-    private data class AdminStatsSources(
-        val usersTotal: Long,
-        val usersActive: Long,
-        val blockedUsers: Long,
-        val audience: AudienceRepo.AudienceContext,
     )
 
     private companion object {
@@ -1477,35 +1475,58 @@ class TelegramLongPolling(
             )
             broadcastJob = GlobalScope.launch {
                 try {
-                    val context = runCatching { AudienceRepo.createContext(includeBlocked = false) }
+                    val audience = runCatching {
+                        BroadcastAudience(
+                            totalUsers = UsersRepo.countUsers(includeBlocked = true),
+                            activeUsers = UsersRepo.countUsers(includeBlocked = false),
+                            blockedUsers = UsersRepo.countBlocked()
+                        )
+                    }
                         .onFailure {
                             println("ADMIN-BROADCAST-ERR: failed to form audience ${it.message}")
                             api.sendMessage(adminChatId, "Не удалось получить список пользователей. Проверьте логи.", parseMode = null)
                         }
                         .getOrNull()
                         ?: return@launch
-                    val totalRecipients = context.filteredCount
+                    val totalRecipients = audience.activeUsers
                     if (totalRecipients <= 0L) {
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
                     }
-                    println("BCAST-START total=$totalRecipients type=${broadcastType.name}")
+                    val blockedSkipped = audience.blockedUsers.coerceAtLeast(0L)
+                    println(
+                        "BCAST-START total=$totalRecipients type=${broadcastType.name} " +
+                            "blocked_skipped=$blockedSkipped known_users=${audience.totalUsers}"
+                    )
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_start",
                         target = adminChatId.toString(),
-                        meta = "recipients=$totalRecipients type=${broadcastType.name}"
+                        meta = "recipients=$totalRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name}"
                     )
                     var sentRecipients = 0L
                     var failedRecipients = 0L
                     var blockedRecipients = 0L
-                    var offset = 0L
-                    while (offset < totalRecipients) {
-                        val batch = AudienceRepo.loadPage(context, offset, BROADCAST_BATCH_SIZE)
+                    var lastUserId: Long? = null
+                    while (true) {
+                        val batch = runCatching {
+                            UsersRepo.loadActiveBatch(afterUserId = lastUserId, limit = BROADCAST_BATCH_SIZE)
+                        }
+                            .onFailure {
+                                println("ADMIN-BROADCAST-ERR: load_recipients ${it.message}")
+                                api.sendMessage(
+                                    adminChatId,
+                                    "Не удалось получить список пользователей. Проверьте логи.",
+                                    parseMode = null
+                                )
+                            }
+                            .getOrNull()
+                            ?: return@launch
                         if (batch.isEmpty()) {
                             break
                         }
                         for (recipient in batch) {
+                            lastUserId = recipient
                             val outcome = sendBroadcastToUser(recipient, draft)
                             when (outcome.result) {
                                 BroadcastResult.SENT -> {
@@ -1531,26 +1552,26 @@ class TelegramLongPolling(
                             )
                             delay(delayMs)
                         }
-                        offset += batch.size
                     }
                     val errors = failedRecipients + blockedRecipients
                     val summary = buildString {
                         appendLine("Рассылка завершена (тип: ${broadcastType.displayName}).")
                         appendLine("• Всего в выборке: $totalRecipients")
                         appendLine("• Успешно отправлено: $sentRecipients")
+                        appendLine("• Исключены заранее (заблокировали бота): $blockedSkipped")
                         appendLine("• Ошибок: $errors")
-                        appendLine("• Блокировки: $blockedRecipients")
+                        appendLine("• Блокировки во время отправки: $blockedRecipients")
                     }.trimEnd()
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_done",
                         target = adminChatId.toString(),
-                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients type=${broadcastType.name}"
+                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name}"
                     )
                     println(
                         "BCAST-DONE type=${broadcastType.name} total=$totalRecipients ok=$sentRecipients " +
-                            "err=$errors failed=$failedRecipients blocked=$blockedRecipients"
+                            "err=$errors failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped"
                     )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
@@ -1755,47 +1776,25 @@ class TelegramLongPolling(
     private fun sendAdminStats(chatId: Long) {
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
-        val statsWithContext = runCatching {
-            val audience = AudienceRepo.createContext(includeBlocked = false)
+        val stats = runCatching {
             val usersTotal = UsersRepo.countUsers(includeBlocked = true)
             val usersActive = UsersRepo.countUsers(includeBlocked = false)
             val blockedUsers = UsersRepo.countBlocked()
-            val total = when {
-                usersTotal > 0L -> usersTotal
-                audience.unionCount > 0L -> audience.unionCount
-                else -> 0L
-            }
-            val activeInstalls = when {
-                usersTotal > 0L -> usersActive
-                audience.unionCount > 0L -> audience.filteredCount
-                else -> 0L
-            }
-            val blocked = when {
-                blockedUsers > 0L -> blockedUsers
-                usersTotal > 0L -> (usersTotal - usersActive).coerceAtLeast(0L)
-                audience.unionCount > 0L -> audience.blockedFiltered.coerceAtLeast(0L)
-                else -> 0L
-            }
             val premium = PremiumRepo.countActive()
-            val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
-            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d) to
-                AdminStatsSources(
-                    usersTotal = usersTotal,
-                    usersActive = usersActive,
-                    blockedUsers = blockedUsers,
-                    audience = audience,
-                )
+            val active7d = MessagesRepo.countActiveSince(
+                System.currentTimeMillis() - 7L * DAY_MS,
+                onlyActiveUsers = true
+            )
+            println(
+                "ADMIN-STATS-SRC: users_total=$usersTotal users_active=$usersActive " +
+                    "users_blocked=$blockedUsers premium_active=$premium active7d=$active7d"
+            )
+            AdminStatsSnapshot(usersTotal, usersActive, blockedUsers, premium, active7d)
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
-        val (stats, sources) = statsWithContext
-        println(
-            "ADMIN-STATS-SRC: usersTotal=${sources.usersTotal} usersActive=${sources.usersActive} " +
-                "audienceTotal=${sources.audience.unionCount} audienceActive=${sources.audience.filteredCount} " +
-                "audienceBlocked=${sources.audience.blockedFiltered} blockedUsers=${sources.blockedUsers}"
-        )
         val total = stats.total.coerceAtLeast(0L)
         val blocked = stats.blocked.coerceAtLeast(0L)
         val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
