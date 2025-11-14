@@ -82,8 +82,12 @@ class OpenAIClient(
         val payload: MutableMap<String, Any> = mutableMapOf(
             "model" to model,
             "messages" to messages,
-            "max_tokens" to maxCompletionTokens
         )
+        if (usesCompletionTokens(model)) {
+            payload["max_completion_tokens"] = maxCompletionTokens
+        } else {
+            payload["max_tokens"] = maxCompletionTokens
+        }
         if (supportsTemperature(model) && temperature != null) {
             payload["temperature"] = temperature
         }
@@ -146,5 +150,14 @@ class OpenAIClient(
         // семейства, где temperature сейчас НЕ поддерживается в /chat/completions
         val noTemp = m.startsWith("gpt-5.1") || m.startsWith("o4") || m.contains("omni")
         return !noTemp
+    }
+
+    private fun usesCompletionTokens(model: String): Boolean {
+        val normalized = model.lowercase()
+        if (normalized.contains("reasoning")) return true
+        return normalized.startsWith("gpt-5") ||
+            normalized.startsWith("gpt-4.1") ||
+            normalized.startsWith("o3") ||
+            normalized.startsWith("o4")
     }
 }
