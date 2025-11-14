@@ -93,6 +93,13 @@ class TelegramLongPolling(
         val active7d: Long,
     )
 
+    private data class AdminStatsSources(
+        val usersTotal: Long,
+        val usersActive: Long,
+        val blockedUsers: Long,
+        val audience: AudienceRepo.AudienceContext,
+    )
+
     private companion object {
         private const val CB_RECIPES = "menu_recipes"
         private const val CB_CALC = "menu_calc"
@@ -274,29 +281,62 @@ class TelegramLongPolling(
         }
     }
 
-    private fun markUserActive(userId: Long, reason: String) {
+    private fun markUserActive(userId: Long, source: String) {
         if (userId <= 0) return
-        runCatching {
-            val changed = UsersRepo.markBlocked(userId, blocked = false)
-            if (changed) {
-                println("USERS-UNBLOCK: user=$userId source=$reason")
+        runCatching { UsersRepo.markBlocked(userId, blocked = false) }
+            .onSuccess { result ->
+                if (result.changed && result.previousBlocked && !result.currentBlocked) {
+                    println("USER-UNBLOCKED: user_id=$userId source=$source")
+                }
             }
-        }.onFailure {
-            println("USERS-UNBLOCK-ERR: user=$userId source=$reason reason=${it.message}")
-        }
+            .onFailure {
+                println("USER-UNBLOCKED-ERR: user_id=$userId source=$source reason=${it.message}")
+            }
     }
 
-    private fun markUserBlocked(userId: Long, reason: String, status: String? = null) {
+    private fun markUserBlocked(
+        userId: Long,
+        source: String,
+        reason: String? = null,
+        status: String? = null
+    ) {
         if (userId <= 0) return
-        runCatching {
-            val changed = UsersRepo.markBlocked(userId, blocked = true)
-            if (changed) {
-                val statusPart = status?.let { " status=$it" } ?: ""
-                println("USERS-BLOCK: user=$userId source=$reason$statusPart")
+        val sanitizedReason = sanitizeLogValue(reason)
+        val sanitizedStatus = sanitizeLogValue(status)
+        runCatching { UsersRepo.markBlocked(userId, blocked = true) }
+            .onSuccess { result ->
+                if (result.changed && result.currentBlocked) {
+                    val parts = mutableListOf("USER-BLOCKED: user_id=$userId", "source=$source")
+                    sanitizedReason?.let { parts += "reason=$it" }
+                    sanitizedStatus?.let { parts += "status=$it" }
+                    println(parts.joinToString(separator = " "))
+                }
             }
-        }.onFailure {
-            println("USERS-BLOCK-ERR: user=$userId source=$reason reason=${it.message}")
-        }
+            .onFailure {
+                println("USER-BLOCKED-ERR: user_id=$userId source=$source reason=${it.message}")
+            }
+    }
+
+    private fun sanitizeLogValue(raw: String?): String? = raw
+        ?.replace("\n", " ")
+        ?.replace("\r", " ")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.take(200)
+
+    private fun isBlockedReason(raw: String?): Boolean {
+        if (raw.isNullOrBlank()) return false
+        val normalized = raw.lowercase()
+        return normalized.contains("bot was blocked by the user") ||
+            normalized.contains("user is deactivated") ||
+            normalized.contains("chat is deactivated") ||
+            normalized.contains("chat not found") ||
+            normalized.contains("chat_not_found") ||
+            normalized.contains("peer not found") ||
+            normalized.contains("peer_not_found") ||
+            normalized.contains("user not found") ||
+            normalized.contains("user is deleted") ||
+            normalized.contains("deleted account")
     }
 
     private fun handleChatMemberUpdate(update: TgChatMemberUpdated, source: String) {
@@ -329,7 +369,7 @@ class TelegramLongPolling(
                 append(" canSend=")
                 append(canSend)
             }
-            markUserBlocked(userId, "chat_member:$source", statusDetails)
+            markUserBlocked(userId, "chat_member:$source", reason = statusDetails)
             return
         }
         val shouldActivate = when (newStatus) {
@@ -1475,13 +1515,13 @@ class TelegramLongPolling(
                                 BroadcastResult.BLOCKED -> {
                                     blockedRecipients++
                                     val code = outcome.errorCode?.toString() ?: "403"
-                                    val desc = outcome.description?.replace("\n", " ")?.take(200) ?: "blocked"
+                                    val desc = sanitizeLogValue(outcome.description) ?: "blocked"
                                     println("BCAST-ERR user=$recipient code=$code reason=$desc")
                                 }
                                 BroadcastResult.FAILED -> {
                                     failedRecipients++
                                     val code = outcome.errorCode?.toString() ?: "unknown"
-                                    val desc = outcome.description?.replace("\n", " ")?.take(200) ?: "unknown"
+                                    val desc = sanitizeLogValue(outcome.description) ?: "unknown"
                                     println("BCAST-ERR user=$recipient code=$code reason=$desc")
                                 }
                             }
@@ -1494,7 +1534,13 @@ class TelegramLongPolling(
                         offset += batch.size
                     }
                     val errors = failedRecipients + blockedRecipients
-                    val summary = "Рассылка завершена (тип: ${broadcastType.displayName}). ok=$sentRecipients, errors=$errors"
+                    val summary = buildString {
+                        appendLine("Рассылка завершена (тип: ${broadcastType.displayName}).")
+                        appendLine("• Всего в выборке: $totalRecipients")
+                        appendLine("• Успешно отправлено: $sentRecipients")
+                        appendLine("• Ошибок: $errors")
+                        appendLine("• Блокировки: $blockedRecipients")
+                    }.trimEnd()
                     api.sendMessage(adminChatId, summary, parseMode = null)
                     AdminAuditRepo.record(
                         adminId = adminId,
@@ -1503,8 +1549,8 @@ class TelegramLongPolling(
                         meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients type=${broadcastType.name}"
                     )
                     println(
-                        "BCAST-DONE type=${broadcastType.name} ok=$sentRecipients err=$errors " +
-                            "failed=$failedRecipients blocked=$blockedRecipients"
+                        "BCAST-DONE type=${broadcastType.name} total=$totalRecipients ok=$sentRecipients " +
+                            "err=$errors failed=$failedRecipients blocked=$blockedRecipients"
                     )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }
@@ -1515,15 +1561,15 @@ class TelegramLongPolling(
 
     private fun isBlockedResponse(code: Int?, description: String?): Boolean {
         if (code == 403) return true
-        val normalized = description?.lowercase()?.trim() ?: return false
-        return normalized.contains("bot was blocked by the user")
+        if (code == 400 && isBlockedReason(description)) return true
+        return isBlockedReason(description)
     }
 
     private fun isBlockedException(message: String?): Boolean {
         if (message.isNullOrBlank()) return false
         val normalized = message.lowercase()
-        if (normalized.contains("bot was blocked by the user")) return true
-        return normalized.contains("forbidden") && normalized.contains("403")
+        if (normalized.contains("403") && normalized.contains("forbidden")) return true
+        return isBlockedReason(message)
     }
 
     private suspend fun sendBroadcastToUser(recipient: Long, draft: BroadcastDraft): BroadcastSendOutcome {
@@ -1543,7 +1589,7 @@ class TelegramLongPolling(
             } catch (t: Throwable) {
                 val message = t.message
                 if (isBlockedException(message)) {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, 403, message)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
                 }
                 println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
@@ -1560,7 +1606,7 @@ class TelegramLongPolling(
                     delay((waitSec + 1) * 1000L)
                 }
                 isBlockedResponse(outcome.errorCode, outcome.description) -> {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, outcome.errorCode, outcome.description)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
                 }
                 outcome.errorCode == 400 -> {
@@ -1593,7 +1639,7 @@ class TelegramLongPolling(
             } catch (t: Throwable) {
                 val message = t.message
                 if (isBlockedException(message)) {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, 403, message)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
                 }
                 println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
@@ -1610,7 +1656,7 @@ class TelegramLongPolling(
                     delay((waitSec + 1) * 1000L)
                 }
                 isBlockedResponse(outcome.errorCode, outcome.description) -> {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, outcome.errorCode, outcome.description)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
                 }
                 else -> {
@@ -1632,7 +1678,7 @@ class TelegramLongPolling(
             } catch (t: Throwable) {
                 val message = t.message
                 if (isBlockedException(message)) {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, 403, message)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
                 }
                 println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
@@ -1649,7 +1695,7 @@ class TelegramLongPolling(
                     delay((waitSec + 1) * 1000L)
                 }
                 isBlockedResponse(outcome.errorCode, outcome.description) -> {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, outcome.errorCode, outcome.description)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
                 }
                 else -> {
@@ -1671,7 +1717,7 @@ class TelegramLongPolling(
             } catch (t: Throwable) {
                 val message = t.message
                 if (isBlockedException(message)) {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, 403, message)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, 403, message)
                 }
                 println("BCAST-ERR user=$recipient code=exception reason=${message ?: "unknown"} attempt=${attempt + 1}")
@@ -1688,7 +1734,7 @@ class TelegramLongPolling(
                     delay((waitSec + 1) * 1000L)
                 }
                 isBlockedResponse(outcome.errorCode, outcome.description) -> {
-                    markRecipientBlocked(recipient)
+                    markRecipientBlocked(recipient, outcome.errorCode, outcome.description)
                     return BroadcastSendOutcome(BroadcastResult.BLOCKED, outcome.errorCode, outcome.description)
                 }
                 else -> {
@@ -1699,26 +1745,57 @@ class TelegramLongPolling(
         return BroadcastSendOutcome(BroadcastResult.FAILED, 500, "video_fallback_retries_exhausted")
     }
 
-    private fun markRecipientBlocked(recipient: Long) {
-        markUserBlocked(recipient, "broadcast")
+    private fun markRecipientBlocked(recipient: Long, code: Int?, description: String?) {
+        val reason = sanitizeLogValue(description) ?: "unknown"
+        markUserBlocked(recipient, "broadcast", reason = reason)
+        val codeLabel = code?.toString() ?: "unknown"
+        println("BROADCAST-USER-BLOCKED: user_id=$recipient code=$codeLabel reason=$reason")
     }
 
     private fun sendAdminStats(chatId: Long) {
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
-        val stats = runCatching {
+        val statsWithContext = runCatching {
             val audience = AudienceRepo.createContext(includeBlocked = false)
-            val total = audience.unionCount
-            val blocked = UsersRepo.countBlocked()
+            val usersTotal = UsersRepo.countUsers(includeBlocked = true)
+            val usersActive = UsersRepo.countUsers(includeBlocked = false)
+            val blockedUsers = UsersRepo.countBlocked()
+            val total = when {
+                usersTotal > 0L -> usersTotal
+                audience.unionCount > 0L -> audience.unionCount
+                else -> 0L
+            }
+            val activeInstalls = when {
+                usersTotal > 0L -> usersActive
+                audience.unionCount > 0L -> audience.filteredCount
+                else -> 0L
+            }
+            val blocked = when {
+                blockedUsers > 0L -> blockedUsers
+                usersTotal > 0L -> (usersTotal - usersActive).coerceAtLeast(0L)
+                audience.unionCount > 0L -> audience.blockedFiltered.coerceAtLeast(0L)
+                else -> 0L
+            }
             val premium = PremiumRepo.countActive()
             val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
-            val activeInstalls = audience.filteredCount.coerceAtLeast(0L)
-            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d)
+            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d) to
+                AdminStatsSources(
+                    usersTotal = usersTotal,
+                    usersActive = usersActive,
+                    blockedUsers = blockedUsers,
+                    audience = audience,
+                )
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
+        val (stats, sources) = statsWithContext
+        println(
+            "ADMIN-STATS-SRC: usersTotal=${sources.usersTotal} usersActive=${sources.usersActive} " +
+                "audienceTotal=${sources.audience.unionCount} audienceActive=${sources.audience.filteredCount} " +
+                "audienceBlocked=${sources.audience.blockedFiltered} blockedUsers=${sources.blockedUsers}"
+        )
         val total = stats.total.coerceAtLeast(0L)
         val blocked = stats.blocked.coerceAtLeast(0L)
         val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
