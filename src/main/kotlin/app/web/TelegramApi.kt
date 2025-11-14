@@ -1,6 +1,7 @@
 package app.web
 
 import app.AppConfig
+import app.db.UsersRepo
 import app.web.dto.*
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
@@ -41,6 +42,70 @@ class TelegramApi(private val token: String) {
 
     private fun sanitizeBody(body: String, limit: Int = 400): String =
         body.replace("\n", " ").replace("\r", " ").take(limit)
+
+    private fun sanitizeReason(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return sanitizeBody(raw, limit = 200).trim().takeIf { it.isNotEmpty() }
+    }
+
+    private fun isBlockingError(code: Int?, description: String?): Boolean {
+        if (code == 403) return true
+        val normalized = description?.lowercase()
+        if (normalized.isNullOrBlank()) return false
+        if (normalized.contains("bot was blocked by the user")) return true
+        if (normalized.contains("user is deactivated")) return true
+        if (normalized.contains("chat not found") || normalized.contains("chat_not_found")) return code == 400 || code == 403
+        if (normalized.contains("user not found")) return true
+        if (normalized.contains("deleted account")) return true
+        return false
+    }
+
+    private fun markUserBlockedFromSend(chatId: Long, method: String, description: String?) {
+        if (chatId <= 0) return
+        val reason = sanitizeReason(description) ?: "unknown"
+        runCatching { UsersRepo.markBlocked(chatId, blocked = true) }
+            .onSuccess { result ->
+                if (result.changed && result.currentBlocked) {
+                    println("USER-BLOCKED: user_id=$chatId source=$method reason=$reason")
+                }
+            }
+            .onFailure {
+                println("USER-BLOCKED-ERR: user_id=$chatId source=$method reason=${it.message}")
+            }
+    }
+
+    private fun markUserUnblockedFromSend(chatId: Long, method: String) {
+        if (chatId <= 0) return
+        runCatching { UsersRepo.markBlocked(chatId, blocked = false) }
+            .onSuccess { result ->
+                if (result.changed && result.previousBlocked && !result.currentBlocked) {
+                    println("USER-UNBLOCKED: user_id=$chatId source=$method")
+                }
+            }
+            .onFailure {
+                println("USER-UNBLOCKED-ERR: user_id=$chatId source=$method reason=${it.message}")
+            }
+    }
+
+    private fun postProcessSendResult(
+        method: String,
+        chatId: Long,
+        result: TelegramSendResult
+    ): TelegramSendResult {
+        if (result.ok) {
+            if (chatId > 0) {
+                markUserUnblockedFromSend(chatId, method)
+            }
+        } else {
+            val codeLabel = result.errorCode?.toString() ?: "unknown"
+            val description = sanitizeReason(result.description) ?: "unknown"
+            println("TG-HTTP-ERR $method: user_id=$chatId code=$codeLabel description=$description")
+            if (chatId > 0 && isBlockingError(result.errorCode, result.description)) {
+                markUserBlockedFromSend(chatId, method, result.description)
+            }
+        }
+        return result
+    }
 
     fun getMe(): Boolean {
         val req = Request.Builder().url(url("getMe")).get().build()
@@ -128,7 +193,7 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendMessage")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            return try {
+            val result = try {
                 val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
                 val success = parsed.ok && r.isSuccessful
                 TelegramSendResult(
@@ -147,6 +212,7 @@ class TelegramApi(private val token: String) {
                     retryAfterSeconds = null,
                 )
             }
+            return postProcessSendResult("sendMessage", chatId, result)
         }
     }
 
@@ -174,7 +240,7 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendPhoto")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            return try {
+            val result = try {
                 val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
                 val success = parsed.ok && r.isSuccessful
                 TelegramSendResult(
@@ -193,6 +259,7 @@ class TelegramApi(private val token: String) {
                     retryAfterSeconds = null,
                 )
             }
+            return postProcessSendResult("sendPhoto", chatId, result)
         }
     }
 
@@ -220,7 +287,7 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendVideo")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            return try {
+            val result = try {
                 val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
                 val success = parsed.ok && r.isSuccessful
                 TelegramSendResult(
@@ -239,6 +306,7 @@ class TelegramApi(private val token: String) {
                     retryAfterSeconds = null,
                 )
             }
+            return postProcessSendResult("sendVideo", chatId, result)
         }
     }
 
@@ -260,7 +328,7 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("copyMessage")).post(body).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            return try {
+            val result = try {
                 val parsed: TgApiResp<TgMessageId> = mapper.readValue(raw)
                 val success = parsed.ok && r.isSuccessful
                 TelegramSendResult(
@@ -279,6 +347,7 @@ class TelegramApi(private val token: String) {
                     retryAfterSeconds = null,
                 )
             }
+            return postProcessSendResult("copyMessage", chatId, result)
         }
     }
 
@@ -325,8 +394,26 @@ class TelegramApi(private val token: String) {
         val req = Request.Builder().url(url("sendPhoto")).post(form.build()).build()
         client.newCall(req).execute().use { r ->
             val raw = r.body?.string().orEmpty()
-            val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
-            return parsed.result?.message_id
+            val result = try {
+                val parsed: TgApiResp<TgMessage> = mapper.readValue(raw)
+                val success = parsed.ok && r.isSuccessful
+                TelegramSendResult(
+                    ok = success,
+                    messageId = parsed.result?.message_id,
+                    errorCode = if (success) null else parsed.error_code ?: r.code,
+                    description = parsed.description ?: if (r.isSuccessful) null else "HTTP ${r.code}",
+                    retryAfterSeconds = parsed.parameters?.retry_after,
+                )
+            } catch (e: Exception) {
+                TelegramSendResult(
+                    ok = r.isSuccessful,
+                    messageId = null,
+                    errorCode = if (r.isSuccessful) null else r.code,
+                    description = if (r.isSuccessful) "json_parse_error: ${e.message}" else "HTTP ${r.code}",
+                    retryAfterSeconds = null,
+                )
+            }
+            return postProcessSendResult("sendPhoto", chatId, result).messageId
         }
     }
 
@@ -397,6 +484,9 @@ class TelegramApi(private val token: String) {
             }
             if (!r.isSuccessful) {
                 println("TG-HTTP-ERR sendInvoice: code=${r.code} body=$rawSafe req=$reqJsonSafe")
+                if (isBlockingError(r.code, raw)) {
+                    markUserBlockedFromSend(chatId, "sendInvoice", raw)
+                }
                 return false
             }
             return try {
@@ -405,8 +495,14 @@ class TelegramApi(private val token: String) {
                     val errorCode = parsed.error_code?.toString() ?: "unknown"
                     val description = parsed.description ?: "unknown"
                     println("TG-API-ERR sendInvoice: error_code=$errorCode description=$description raw=$rawSafe req=$reqJsonSafe")
+                    if (isBlockingError(parsed.error_code, parsed.description)) {
+                        markUserBlockedFromSend(chatId, "sendInvoice", parsed.description)
+                    }
+                    false
+                } else {
+                    markUserUnblockedFromSend(chatId, "sendInvoice")
+                    true
                 }
-                parsed.ok
             } catch (t: Throwable) {
                 println("TG-JSON-ERR sendInvoice: ${t.message} raw=$rawSafe req=$reqJsonSafe")
                 false
