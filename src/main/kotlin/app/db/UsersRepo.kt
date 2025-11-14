@@ -1,13 +1,18 @@
 package app.db
 
+import org.jetbrains.exposed.sql.SqlExpressionBuilder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.Transaction
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
-import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.or
+import org.jetbrains.exposed.sql.Op
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -39,21 +44,16 @@ object UsersRepo {
             it[Users.blocked] = false
         }
         if (inserted.insertedCount > 0) return@transaction true
-        val updatedFirstSeen = Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
+        Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
             it[Users.first_seen] = now
         } > 0
-        Users.update({ Users.user_id eq userId }) {
-            it[Users.blocked_ts] = 0L
-            it[Users.blocked] = false
-        }
-        updatedFirstSeen
     }
 
     fun getAllUserIds(includeBlocked: Boolean = false): List<Long> = transaction {
         val query = if (includeBlocked) {
             Users.slice(Users.user_id).selectAll()
         } else {
-            Users.slice(Users.user_id).select { Users.blocked eq false }
+            Users.slice(Users.user_id).select { activeUsersCondition() }
         }
         query.map { it[Users.user_id] }
     }
@@ -62,14 +62,14 @@ object UsersRepo {
         val query = if (includeBlocked) {
             Users.selectAll()
         } else {
-            Users.select { Users.blocked eq false }
+            Users.select { activeUsersCondition() }
         }
         query.count().toLong()
     }
 
     fun countBlocked(): Long = transaction {
         Users
-            .select { Users.blocked eq true }
+            .select { blockedUsersCondition() }
             .count()
             .toLong()
     }
@@ -88,11 +88,12 @@ object UsersRepo {
             .limit(1)
             .firstOrNull()
             ?.let {
+                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
                 UserInfo(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen],
-                    blockedTs = it[Users.blocked_ts],
-                    blocked = it[Users.blocked]
+                    blockedTs = normalizedBlockedTs,
+                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
                 )
             }
     }
@@ -103,12 +104,13 @@ object UsersRepo {
             .limit(1)
             .firstOrNull()
             ?.let {
+                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
                 return@transaction UserSnapshot(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
-                    blockedTs = it[Users.blocked_ts],
+                    blockedTs = normalizedBlockedTs,
                     existsInUsers = true,
-                    blocked = it[Users.blocked]
+                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
                 )
             }
 
@@ -128,6 +130,33 @@ object UsersRepo {
 
     fun markBlocked(userId: Long, blocked: Boolean, now: Long = System.currentTimeMillis()): Boolean = transaction {
         val value = if (blocked) now else 0L
+
+        val inserted = Users.insertIgnore {
+            it[Users.user_id] = userId
+            it[Users.first_seen] = now
+            it[Users.blocked_ts] = value
+            it[Users.blocked] = blocked
+        }
+        if (inserted.insertedCount > 0) {
+            return@transaction true
+        }
+
+        val existing = Users
+            .slice(Users.blocked, Users.blocked_ts)
+            .select { Users.user_id eq userId }
+            .limit(1)
+            .firstOrNull()
+            ?: return@transaction false
+
+        val currentBlocked = existing[Users.blocked]
+        val currentBlockedTs = existing[Users.blocked_ts]
+        val shouldUpdate = when {
+            blocked -> !currentBlocked || currentBlockedTs != value
+            else -> currentBlocked || currentBlockedTs != 0L
+        }
+
+        if (!shouldUpdate) return@transaction false
+
         Users.update({ Users.user_id eq userId }) { row ->
             row[Users.blocked_ts] = value
             row[Users.blocked] = blocked
@@ -294,8 +323,6 @@ object UsersRepo {
             ?: return EnsureResult(success = false, inserted = false)
 
         val existingFirst = row[Users.first_seen]
-        val existingBlockedTs = row[Users.blocked_ts]
-        val existingBlockedFlag = row[Users.blocked]
         val desiredFirst = when {
             resolvedTs != null && resolvedTs > 0L && existingFirst > 0L -> min(existingFirst, resolvedTs)
             resolvedTs != null && resolvedTs > 0L -> resolvedTs
@@ -303,14 +330,9 @@ object UsersRepo {
             else -> now
         }
         val needsFirstUpdate = desiredFirst != existingFirst
-        val needsBlockReset = existingBlockedTs > 0L || existingBlockedFlag
-        if (needsFirstUpdate || needsBlockReset) {
+        if (needsFirstUpdate) {
             Users.update({ Users.user_id eq userId }) { update ->
-                if (needsFirstUpdate) update[Users.first_seen] = desiredFirst
-                if (needsBlockReset) {
-                    update[Users.blocked_ts] = 0L
-                    update[Users.blocked] = false
-                }
+                update[Users.first_seen] = desiredFirst
             }
         }
         return EnsureResult(success = true, inserted = false)
@@ -404,6 +426,20 @@ object UsersRepo {
         scanPresence("premium_users")
 
         return hasPresence to earliest
+    }
+
+    private fun SqlExpressionBuilder.blockedUsersCondition(): Op<Boolean> =
+        (Users.blocked eq true) or (Users.blocked_ts greater 0L)
+
+    private fun SqlExpressionBuilder.activeUsersCondition(): Op<Boolean> =
+        (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
+
+    private fun isRowBlocked(blockedFlag: Boolean, blockedTs: Long): Boolean =
+        blockedFlag || blockedTs > 0L
+
+    private fun normalizeBlockedTimestamp(raw: Long): Long {
+        if (raw <= 0L) return 0L
+        return if (raw in 1_000_000_000L..4_000_000_000L) raw * 1000L else raw
     }
 
     private fun parseUserId(rs: ResultSet, column: String = "user_id"): Long? {
