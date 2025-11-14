@@ -1,13 +1,18 @@
 package app.db
 
+import org.jetbrains.exposed.sql.SqlExpressionBuilder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.Transaction
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
-import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.or
+import org.jetbrains.exposed.sql.Op
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -48,7 +53,7 @@ object UsersRepo {
         val query = if (includeBlocked) {
             Users.slice(Users.user_id).selectAll()
         } else {
-            Users.slice(Users.user_id).select { Users.blocked eq false }
+            Users.slice(Users.user_id).select { activeUsersCondition() }
         }
         query.map { it[Users.user_id] }
     }
@@ -57,14 +62,14 @@ object UsersRepo {
         val query = if (includeBlocked) {
             Users.selectAll()
         } else {
-            Users.select { Users.blocked eq false }
+            Users.select { activeUsersCondition() }
         }
         query.count().toLong()
     }
 
     fun countBlocked(): Long = transaction {
         Users
-            .select { Users.blocked eq true }
+            .select { blockedUsersCondition() }
             .count()
             .toLong()
     }
@@ -87,7 +92,7 @@ object UsersRepo {
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen],
                     blockedTs = it[Users.blocked_ts],
-                    blocked = it[Users.blocked]
+                    blocked = isRowBlocked(it[Users.blocked], it[Users.blocked_ts])
                 )
             }
     }
@@ -103,7 +108,7 @@ object UsersRepo {
                     firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
                     blockedTs = it[Users.blocked_ts],
                     existsInUsers = true,
-                    blocked = it[Users.blocked]
+                    blocked = isRowBlocked(it[Users.blocked], it[Users.blocked_ts])
                 )
             }
 
@@ -416,6 +421,15 @@ object UsersRepo {
 
         return hasPresence to earliest
     }
+
+    private fun SqlExpressionBuilder.blockedUsersCondition(): Op<Boolean> =
+        (Users.blocked eq true) or (Users.blocked_ts greater 0L)
+
+    private fun SqlExpressionBuilder.activeUsersCondition(): Op<Boolean> =
+        (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
+
+    private fun isRowBlocked(blockedFlag: Boolean, blockedTs: Long): Boolean =
+        blockedFlag || blockedTs > 0L
 
     private fun parseUserId(rs: ResultSet, column: String = "user_id"): Long? {
         val raw = rs.getObject(column) ?: return null
