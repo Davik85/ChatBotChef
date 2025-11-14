@@ -312,8 +312,6 @@ object UsersRepo {
             ?: return EnsureResult(success = false, inserted = false)
 
         val existingFirst = row[Users.first_seen]
-        val existingBlockedTs = row[Users.blocked_ts]
-        val existingBlockedFlag = row[Users.blocked]
         val desiredFirst = when {
             resolvedTs != null && resolvedTs > 0L && existingFirst > 0L -> min(existingFirst, resolvedTs)
             resolvedTs != null && resolvedTs > 0L -> resolvedTs
@@ -321,14 +319,9 @@ object UsersRepo {
             else -> now
         }
         val needsFirstUpdate = desiredFirst != existingFirst
-        val needsBlockReset = existingBlockedTs > 0L || existingBlockedFlag
-        if (needsFirstUpdate || needsBlockReset) {
+        if (needsFirstUpdate) {
             Users.update({ Users.user_id eq userId }) { update ->
-                if (needsFirstUpdate) update[Users.first_seen] = desiredFirst
-                if (needsBlockReset) {
-                    update[Users.blocked_ts] = 0L
-                    update[Users.blocked] = false
-                }
+                update[Users.first_seen] = desiredFirst
             }
         }
         return EnsureResult(success = true, inserted = false)
