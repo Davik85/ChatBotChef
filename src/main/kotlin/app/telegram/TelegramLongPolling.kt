@@ -89,6 +89,7 @@ class TelegramLongPolling(
         val totalUsers: Long,
         val activeUsers: Long,
         val blockedUsers: Long,
+        val activeThreshold: Long,
     )
 
     private companion object {
@@ -1526,11 +1527,14 @@ class TelegramLongPolling(
             broadcastJob = GlobalScope.launch {
                 try {
                     val audience = runCatching {
-                        val snapshot = StatsService.collect()
+                        val now = System.currentTimeMillis()
+                        val snapshot = StatsService.collect(now)
+                        val activeThreshold = StatsService.activeInstallThreshold(now)
                         BroadcastAudience(
                             totalUsers = snapshot.total,
                             activeUsers = snapshot.activeInstalls,
-                            blockedUsers = snapshot.blocked
+                            blockedUsers = snapshot.blocked,
+                            activeThreshold = activeThreshold
                         )
                     }
                         .onFailure {
@@ -1547,7 +1551,8 @@ class TelegramLongPolling(
                     val blockedSkipped = audience.blockedUsers.coerceAtLeast(0L)
                     println(
                         "BCAST-START total=$totalRecipients type=${broadcastType.name} " +
-                            "blocked_skipped=$blockedSkipped known_users=${audience.totalUsers}"
+                            "blocked_skipped=$blockedSkipped known_users=${audience.totalUsers} " +
+                            "threshold=${audience.activeThreshold}"
                     )
                     AdminAuditRepo.record(
                         adminId = adminId,
@@ -1561,7 +1566,11 @@ class TelegramLongPolling(
                     var lastUserId: Long? = null
                     while (true) {
                         val batch = runCatching {
-                            UsersRepo.loadActiveBatch(afterUserId = lastUserId, limit = BROADCAST_BATCH_SIZE)
+                            UsersRepo.loadActiveBatch(
+                                afterUserId = lastUserId,
+                                limit = BROADCAST_BATCH_SIZE,
+                                activeSince = audience.activeThreshold
+                            )
                         }
                             .onFailure {
                                 println("ADMIN-BROADCAST-ERR: load_recipients ${it.message}")
@@ -1574,8 +1583,15 @@ class TelegramLongPolling(
                             .getOrNull()
                             ?: return@launch
                         if (batch.isEmpty()) {
+                            println(
+                                "BCAST-BATCH-EMPTY after=${lastUserId ?: 0L} threshold=${audience.activeThreshold}"
+                            )
                             break
                         }
+                        println(
+                            "BCAST-BATCH size=${batch.size} first=${batch.first()} last=${batch.last()} " +
+                                "threshold=${audience.activeThreshold}"
+                        )
                         for (recipient in batch) {
                             lastUserId = recipient
                             val outcome = sendBroadcastToUser(recipient, draft)
