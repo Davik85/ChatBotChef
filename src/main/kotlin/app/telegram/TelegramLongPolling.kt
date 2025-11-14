@@ -1510,7 +1510,7 @@ class TelegramLongPolling(
                             delay(delayMs)
                         }
                     }
-                    val errors = failedRecipients + blockedRecipients
+                    val errors = failedRecipients
                     val summary = buildString {
                         appendLine("Рассылка завершена (тип: ${broadcastType.displayName}).")
                         appendLine("• Всего в выборке: $totalRecipients")

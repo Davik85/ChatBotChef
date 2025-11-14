@@ -15,6 +15,7 @@ import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.Op
 import org.jetbrains.exposed.sql.SortOrder
+import org.jetbrains.exposed.sql.count
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -101,26 +102,33 @@ object UsersRepo {
     }
 
     fun countUsers(includeBlocked: Boolean = true): Long = transaction {
+        val countExpr = Users.user_id.count()
         val query = if (includeBlocked) {
-            Users.selectAll()
+            Users.slice(countExpr).selectAll()
         } else {
-            Users.select { activeUsersCondition() }
+            Users.slice(countExpr).select { activeUsersCondition() }
         }
-        query.count().toLong()
+        query.firstOrNull()?.get(countExpr) ?: 0L
     }
 
     fun countBlocked(): Long = transaction {
+        val countExpr = Users.user_id.count()
         Users
+            .slice(countExpr)
             .select { blockedUsersCondition() }
-            .count()
-            .toLong()
+            .firstOrNull()
+            ?.get(countExpr)
+            ?: 0L
     }
 
     fun countActiveSince(fromMs: Long): Long = transaction {
+        val countExpr = Users.user_id.count()
         Users
+            .slice(countExpr)
             .select { activeUsersCondition() and (Users.last_seen greaterEq fromMs) }
-            .count()
-            .toLong()
+            .firstOrNull()
+            ?.get(countExpr)
+            ?: 0L
     }
 
     fun loadActiveBatch(afterUserId: Long? = null, limit: Int): List<Long> = transaction {

@@ -16,8 +16,8 @@ object StatsService {
 
     fun collect(now: Long = System.currentTimeMillis()): Snapshot {
         val total = UsersRepo.countUsers(includeBlocked = true)
-        val blocked = UsersRepo.countBlocked()
-        val activeInstalls = (total - blocked).coerceAtLeast(0)
+        val activeInstalls = UsersRepo.countUsers(includeBlocked = false).coerceAtMost(total)
+        val blocked = UsersRepo.countBlocked().coerceAtMost(total)
         val premium = PremiumRepo.countActive(now)
         val active7d = UsersRepo.countActiveSince(now - 7 * DAY_MS).coerceAtLeast(0)
         return Snapshot(
