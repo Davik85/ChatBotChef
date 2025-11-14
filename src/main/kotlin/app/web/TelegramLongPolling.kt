@@ -93,6 +93,13 @@ class TelegramLongPolling(
         val active7d: Long,
     )
 
+    private data class AdminStatsSources(
+        val usersTotal: Long,
+        val usersActive: Long,
+        val blockedUsers: Long,
+        val audience: AudienceRepo.AudienceContext,
+    )
+
     private companion object {
         private const val CB_RECIPES = "menu_recipes"
         private const val CB_CALC = "menu_calc"
@@ -1744,18 +1751,47 @@ class TelegramLongPolling(
     private fun sendAdminStats(chatId: Long) {
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
-        val stats = runCatching {
-            val total = UsersRepo.countUsers(includeBlocked = true)
-            val activeInstalls = UsersRepo.countUsers(includeBlocked = false)
-            val blocked = UsersRepo.countBlocked()
+        val statsWithContext = runCatching {
+            val audience = AudienceRepo.createContext(includeBlocked = false)
+            val usersTotal = UsersRepo.countUsers(includeBlocked = true)
+            val usersActive = UsersRepo.countUsers(includeBlocked = false)
+            val blockedUsers = UsersRepo.countBlocked()
+            val total = when {
+                usersTotal > 0L -> usersTotal
+                audience.unionCount > 0L -> audience.unionCount
+                else -> 0L
+            }
+            val activeInstalls = when {
+                usersTotal > 0L -> usersActive
+                audience.unionCount > 0L -> audience.filteredCount
+                else -> 0L
+            }
+            val blocked = when {
+                blockedUsers > 0L -> blockedUsers
+                usersTotal > 0L -> (usersTotal - usersActive).coerceAtLeast(0L)
+                audience.unionCount > 0L -> audience.blockedFiltered.coerceAtLeast(0L)
+                else -> 0L
+            }
             val premium = PremiumRepo.countActive()
             val active7d = MessagesRepo.countActiveSince(System.currentTimeMillis() - 7L * DAY_MS)
-            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d)
+            AdminStatsSnapshot(total, activeInstalls, blocked, premium, active7d) to
+                AdminStatsSources(
+                    usersTotal = usersTotal,
+                    usersActive = usersActive,
+                    blockedUsers = blockedUsers,
+                    audience = audience,
+                )
         }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
         }
+        val (stats, sources) = statsWithContext
+        println(
+            "ADMIN-STATS-SRC: usersTotal=${sources.usersTotal} usersActive=${sources.usersActive} " +
+                "audienceTotal=${sources.audience.unionCount} audienceActive=${sources.audience.filteredCount} " +
+                "audienceBlocked=${sources.audience.blockedFiltered} blockedUsers=${sources.blockedUsers}"
+        )
         val total = stats.total.coerceAtLeast(0L)
         val blocked = stats.blocked.coerceAtLeast(0L)
         val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
