@@ -72,6 +72,19 @@ object AppConfig {
         return parseBoolean(key, raw)
     }
 
+    private fun readLongSet(key: String): Set<Long> {
+        val raw = clean(readRaw(key)) ?: return emptySet()
+        if (raw.isBlank()) return emptySet()
+        return raw.split(',')
+            .mapNotNull { token ->
+                val trimmed = token.trim()
+                if (trimmed.isEmpty()) return@mapNotNull null
+                trimmed.toLongOrNull()
+            }
+            .filter { it > 0 }
+            .toSet()
+    }
+
     // Цена и срок подписки
     val premiumPriceRub: Int by lazy { (clean(readRaw("PREMIUM_PRICE_RUB")) ?: "700").toInt() }
     val premiumDays: Int by lazy { (clean(readRaw("PREMIUM_DAYS")) ?: "30").toInt() }
@@ -111,6 +124,8 @@ object AppConfig {
     val requireEmailForReceipt: Boolean by lazy {
         if (!receiptsEnabled) false else readOptionalBoolean("REQUIRE_EMAIL_FOR_RECEIPT") ?: true
     }
+
+    val adminIds: Set<Long> by lazy { readLongSet("ADMIN_IDS") }
 
     // Paywall (используется в paywall-сообщениях)
     val PAYWALL_TEXT: String

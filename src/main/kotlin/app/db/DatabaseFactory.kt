@@ -14,6 +14,7 @@ import kotlin.io.use
 object Users : Table(name = "users") {
     val user_id = long("user_id").uniqueIndex()
     val first_seen = long("first_seen")
+    val last_seen = long("last_seen").default(0)
     val blocked_ts = long("blocked_ts").default(0)
     val blocked = bool("blocked").default(false)
     override val primaryKey = PrimaryKey(user_id)
@@ -186,6 +187,7 @@ object DatabaseFactory {
                         CREATE TABLE users_new(
                             user_id    INTEGER PRIMARY KEY,
                             first_seen INTEGER NOT NULL,
+                            last_seen  INTEGER NOT NULL DEFAULT 0,
                             blocked_ts INTEGER NOT NULL DEFAULT 0,
                             blocked    INTEGER NOT NULL DEFAULT 0
                         );
@@ -193,20 +195,32 @@ object DatabaseFactory {
                     val hasFirstSeen = columnExists(t, "first_seen")
                     val hasBlocked = columnExists(t, "blocked_ts")
                     val hasBlockedFlag = columnExists(t, "blocked")
+                    val hasLastSeen = columnExists(t, "last_seen")
+                    val lastSeenExpr = if (hasLastSeen) {
+                        "COALESCE(last_seen, first_seen, 0)"
+                    } else {
+                        "COALESCE(first_seen, 0)"
+                    }
                     when {
                         hasFirstSeen && hasBlocked && hasBlockedFlag ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
-                                    SELECT user_id, first_seen, blocked_ts, blocked FROM users;
+                                    INSERT INTO users_new(user_id, first_seen, last_seen, blocked_ts, blocked)
+                                    SELECT user_id,
+                                           first_seen,
+                                           ${lastSeenExpr} AS last_seen,
+                                           blocked_ts,
+                                           blocked
+                                    FROM users;
                                 """.trimIndent()
                             )
                         hasFirstSeen && hasBlocked ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    INSERT INTO users_new(user_id, first_seen, last_seen, blocked_ts, blocked)
                                     SELECT user_id,
                                            first_seen,
+                                           ${lastSeenExpr} AS last_seen,
                                            blocked_ts,
                                            CASE WHEN blocked_ts > 0 THEN 1 ELSE 0 END AS blocked
                                     FROM users;
@@ -215,16 +229,22 @@ object DatabaseFactory {
                         hasFirstSeen && hasBlockedFlag ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
-                                    SELECT user_id, first_seen, 0 AS blocked_ts, blocked FROM users;
+                                    INSERT INTO users_new(user_id, first_seen, last_seen, blocked_ts, blocked)
+                                    SELECT user_id,
+                                           first_seen,
+                                           ${lastSeenExpr} AS last_seen,
+                                           0 AS blocked_ts,
+                                           blocked
+                                    FROM users;
                                 """.trimIndent()
                             )
                         else ->
                             exec(
                                 """
-                                    INSERT INTO users_new(user_id, first_seen, blocked_ts, blocked)
+                                    INSERT INTO users_new(user_id, first_seen, last_seen, blocked_ts, blocked)
                                     SELECT user_id,
                                            COALESCE(first_seen, 0) AS first_seen,
+                                           ${lastSeenExpr} AS last_seen,
                                            COALESCE(blocked_ts, 0) AS blocked_ts,
                                            CASE
                                                WHEN COALESCE(blocked_ts, 0) > 0 THEN 1
@@ -234,7 +254,7 @@ object DatabaseFactory {
                                     FROM users;
                                 """.trimIndent()
                             )
-                    }
+                }
                     exec("""DROP TABLE users;""")
                     exec("""ALTER TABLE users_new RENAME TO users;""")
                     exec("""CREATE UNIQUE INDEX IF NOT EXISTS users_user_id ON users(user_id);""")
@@ -433,11 +453,15 @@ object DatabaseFactory {
             }
             if (tableExists("users")) {
                 addColumnIfMissing("users", "first_seen INTEGER NOT NULL DEFAULT 0")
+                addColumnIfMissing("users", "last_seen INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "user_id INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "blocked_ts INTEGER NOT NULL DEFAULT 0")
                 addColumnIfMissing("users", "blocked INTEGER NOT NULL DEFAULT 0")
                 if (columnExists("users", "blocked") && columnExists("users", "blocked_ts")) {
                     exec("""UPDATE users SET blocked = CASE WHEN blocked_ts > 0 THEN 1 ELSE 0 END""")
+                }
+                if (columnExists("users", "last_seen") && columnExists("users", "first_seen")) {
+                    exec("""UPDATE users SET last_seen = CASE WHEN last_seen <= 0 THEN first_seen ELSE last_seen END""")
                 }
             }
             if (tableExists("user_stats")) {

@@ -1,6 +1,5 @@
 package app.db
 
-import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
@@ -40,29 +39,16 @@ object MessagesRepo {
         }
     }
 
-    fun countActiveSince(fromMs: Long, onlyActiveUsers: Boolean = false): Long = transaction {
-        val countExpr = Messages.user_id.countDistinct()
-        val baseCondition = (Messages.ts greater fromMs) and (Messages.role eq "user")
-        if (!onlyActiveUsers) {
+    fun countActiveSince(fromMs: Long, onlyActiveUsers: Boolean = false): Long {
+        if (onlyActiveUsers) {
+            return UsersRepo.countActiveSince(fromMs)
+        }
+        return transaction {
+            val countExpr = Messages.user_id.countDistinct()
+            val baseCondition = (Messages.ts greater fromMs) and (Messages.role eq "user")
             Messages
                 .slice(countExpr)
                 .select { baseCondition }
-                .firstOrNull()
-                ?.get(countExpr)
-                ?.toLong()
-                ?: 0L
-        } else {
-            Messages
-                .join(
-                    Users,
-                    joinType = JoinType.INNER,
-                    onColumn = Messages.user_id,
-                    otherColumn = Users.user_id
-                )
-                .slice(countExpr)
-                .select {
-                    baseCondition and (Users.blocked eq false)
-                }
                 .firstOrNull()
                 ?.get(countExpr)
                 ?.toLong()

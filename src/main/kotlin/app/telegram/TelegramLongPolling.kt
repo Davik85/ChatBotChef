@@ -1,4 +1,4 @@
-package app.web
+package app.telegram
 
 import app.AppConfig
 import app.db.AdminAuditRepo
@@ -6,7 +6,6 @@ import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
 import app.db.ProcessedUpdatesRepo
-import app.db.UserRegistry
 import app.db.UsersRepo
 import app.llm.OpenAIClient
 import app.llm.dto.ChatMessage
@@ -14,14 +13,16 @@ import app.logic.CalorieCalculatorPrompt
 import app.logic.PersonaPrompt
 import app.logic.ProductInfoPrompt
 import app.logic.RateLimiter
+import app.logic.stats.StatsService
+import app.logic.user.UserService
 import app.pay.PaymentService
 import app.pay.ReceiptBuilder
 import app.notify.ReminderJob
-import app.web.dto.InlineKeyboardButton
-import app.web.dto.InlineKeyboardMarkup
-import app.web.dto.TgCallbackQuery
-import app.web.dto.TgUpdate
-import app.web.dto.*
+import app.telegram.dto.InlineKeyboardButton
+import app.telegram.dto.InlineKeyboardMarkup
+import app.telegram.dto.TgCallbackQuery
+import app.telegram.dto.TgUpdate
+import app.telegram.dto.*
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -88,14 +89,6 @@ class TelegramLongPolling(
         val totalUsers: Long,
         val activeUsers: Long,
         val blockedUsers: Long,
-    )
-
-    private data class AdminStatsSnapshot(
-        val total: Long,
-        val activeInstalls: Long,
-        val blocked: Long,
-        val premium: Long,
-        val active7d: Long,
     )
 
     private companion object {
@@ -194,9 +187,7 @@ class TelegramLongPolling(
 
         private const val START_IMAGE_RES = "welcome/start.jpg"
 
-        private val ADMIN_IDS: Set<Long> =
-            (System.getenv("ADMIN_IDS") ?: "")
-                .split(",").mapNotNull { it.trim().toLongOrNull() }.toSet()
+        private val ADMIN_IDS: Set<Long> = AppConfig.adminIds
 
         private val dtf: DateTimeFormatter =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
@@ -279,42 +270,6 @@ class TelegramLongPolling(
         }
     }
 
-    private fun markUserActive(userId: Long, source: String) {
-        if (userId <= 0) return
-        runCatching { UsersRepo.markBlocked(userId, blocked = false) }
-            .onSuccess { result ->
-                if (result.changed && result.previousBlocked && !result.currentBlocked) {
-                    println("USER-UNBLOCKED: user_id=$userId source=$source")
-                }
-            }
-            .onFailure {
-                println("USER-UNBLOCKED-ERR: user_id=$userId source=$source reason=${it.message}")
-            }
-    }
-
-    private fun markUserBlocked(
-        userId: Long,
-        source: String,
-        reason: String? = null,
-        status: String? = null
-    ) {
-        if (userId <= 0) return
-        val sanitizedReason = sanitizeLogValue(reason)
-        val sanitizedStatus = sanitizeLogValue(status)
-        runCatching { UsersRepo.markBlocked(userId, blocked = true) }
-            .onSuccess { result ->
-                if (result.changed && result.currentBlocked) {
-                    val parts = mutableListOf("USER-BLOCKED: user_id=$userId", "source=$source")
-                    sanitizedReason?.let { parts += "reason=$it" }
-                    sanitizedStatus?.let { parts += "status=$it" }
-                    println(parts.joinToString(separator = " "))
-                }
-            }
-            .onFailure {
-                println("USER-BLOCKED-ERR: user_id=$userId source=$source reason=${it.message}")
-            }
-    }
-
     private fun sanitizeLogValue(raw: String?): String? = raw
         ?.replace("\n", " ")
         ?.replace("\r", " ")
@@ -367,7 +322,7 @@ class TelegramLongPolling(
                 append(" canSend=")
                 append(canSend)
             }
-            markUserBlocked(userId, "chat_member:$source", reason = statusDetails)
+            UserService.markBlocked(userId, "chat_member:$source", reason = statusDetails)
             return
         }
         val shouldActivate = when (newStatus) {
@@ -376,21 +331,12 @@ class TelegramLongPolling(
             else -> false
         }
         if (shouldActivate) {
-            markUserActive(userId, "chat_member:$source:$newStatus")
+            UserService.markInteraction(userId, "chat_member:$source:$newStatus")
         }
     }
 
     private fun upsertUser(from: TgUser?, source: String) {
-        val user = from ?: return
-        val now = System.currentTimeMillis()
-        runCatching { UserRegistry.upsert(user, now) }
-            .onSuccess { inserted ->
-                val insertedFlag = if (inserted) 1 else 0
-                println("DB-USERS-UPSERT: id=${user.id} source=$source inserted=$insertedFlag")
-            }
-            .onFailure {
-                println("DB-USERS-UPSERT-ERR: id=${user.id} source=$source reason=${it.message}")
-            }
+        UserService.ensureUser(from, source)
     }
 
     suspend fun run() {
@@ -490,7 +436,7 @@ class TelegramLongPolling(
     // ===== Payments =====
 
     private fun handlePreCheckout(q: TgPreCheckoutQuery) {
-        markUserActive(q.from.id, "pre_checkout")
+        UserService.markInteraction(q.from.id, "pre_checkout")
         trackUserActivity(q.from.id, "[pre_checkout] ${q.invoice_payload ?: ""}")
         val validation = PaymentService.validatePreCheckout(q)
         if (!validation.ok) {
@@ -504,7 +450,7 @@ class TelegramLongPolling(
         val chatId = msg.chat.id
         val payment = msg.successful_payment ?: return
         val payerId = msg.from?.id ?: chatId
-        markUserActive(payerId, "successful_payment")
+        UserService.markInteraction(payerId, "successful_payment")
         val paymentId = payment.provider_payment_charge_id ?: payment.telegram_payment_charge_id ?: ""
         trackUserActivity(payerId, "[payment_success] $paymentId", role = "system")
         val recorded = PaymentService.handleSuccessfulPayment(chatId, payment)
@@ -561,7 +507,7 @@ class TelegramLongPolling(
         val msgId = cb.message.message_id
         val userId = cb.from.id
 
-        markUserActive(userId, "callback")
+        UserService.markInteraction(userId, "callback")
         trackUserActivity(userId, "[callback] ${cb.data.orEmpty()}")
 
         when (cb.data) {
@@ -698,7 +644,7 @@ class TelegramLongPolling(
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
 
-        markUserActive(userId, "message")
+        UserService.markInteraction(userId, "message")
         val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
             msg.document != null ||
             msg.video != null ||
@@ -1064,7 +1010,7 @@ class TelegramLongPolling(
 
     private fun handleChef(chatId: Long, userId: Long, userText: String) {
         val isAdminUser = isAdmin(userId)
-        if (!RateLimiter.allow(chatId, isAdminUser)) {
+        if (!RateLimiter.allow(userId, isAdminUser)) {
             api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
             return
         }
@@ -1076,7 +1022,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
-        RateLimiter.consumeIfFree(chatId, isAdminUser)
+        RateLimiter.consumeIfFree(userId, isAdminUser)
 
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
@@ -1089,7 +1035,7 @@ class TelegramLongPolling(
 
     private fun handleCalorieInput(chatId: Long, userId: Long, userText: String) {
         val isAdminUser = isAdmin(userId)
-        if (!RateLimiter.allow(chatId, isAdminUser)) {
+        if (!RateLimiter.allow(userId, isAdminUser)) {
             api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
             state.remove(chatId)
             return
@@ -1103,7 +1049,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
-        RateLimiter.consumeIfFree(chatId, isAdminUser)
+        RateLimiter.consumeIfFree(userId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
         }
@@ -1116,7 +1062,7 @@ class TelegramLongPolling(
 
     private fun handleProductInput(chatId: Long, userId: Long, userText: String) {
         val isAdminUser = isAdmin(userId)
-        if (!RateLimiter.allow(chatId, isAdminUser)) {
+        if (!RateLimiter.allow(userId, isAdminUser)) {
             api.sendMessage(chatId, AppConfig.PAYWALL_TEXT)
             state.remove(chatId)
             return
@@ -1130,7 +1076,7 @@ class TelegramLongPolling(
         messages += ChatMessage("user", preparedUser)
         val reply = llm.complete(messages)
         api.sendMessage(chatId, reply)
-        RateLimiter.consumeIfFree(chatId, isAdminUser)
+        RateLimiter.consumeIfFree(userId, isAdminUser)
         if (preparedUser.isNotEmpty()) {
             ChatHistoryRepo.append(userId, persona.modeKey(), "user", preparedUser)
         }
@@ -1299,14 +1245,21 @@ class TelegramLongPolling(
             return false
         }
 
+        val now = System.currentTimeMillis()
         if (!snapshot.existsInUsers) {
-            runCatching { UsersRepo.touch(targetId) }
+            runCatching { UsersRepo.recordSeen(targetId, now) }
+                .onSuccess { result ->
+                    val insertedFlag = if (result.inserted) 1 else 0
+                    val updatedFlag = if (result.updated) 1 else 0
+                    println(
+                        "ADMIN-STATUS-REPAIR: requester=$adminId target=$targetId source=$source inserted=$insertedFlag updated=$updatedFlag"
+                    )
+                }
                 .onFailure {
                     println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=touch_failed err=${it.message}")
                 }
         }
 
-        val now = System.currentTimeMillis()
         val until = runCatching { PremiumRepo.getUntil(targetId) }
             .onFailure {
                 println("ADMIN-STATUS-ERR: requester=$adminId target=$targetId source=$source reason=${it.message}")
@@ -1337,6 +1290,7 @@ class TelegramLongPolling(
         val premiumActive = until != null && until > now
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
         val firstSeenDisplay = snapshot.firstSeen?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
+        val lastSeenDisplay = snapshot.lastSeen?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
         val blockedLine = if (snapshot.blocked || snapshot.blockedTs > 0) {
             val blockedAt = snapshot.blockedTs.takeIf { it > 0 }?.let { dtf.format(Instant.ofEpochMilli(it)) }
             if (blockedAt != null) {
@@ -1363,6 +1317,7 @@ class TelegramLongPolling(
         val statusMessage = """
             Telegram ID: $targetId
             Регистрация: $firstSeenDisplay
+            Последняя активность: $lastSeenDisplay
             $blockedLine
             $premiumLine
             Сообщений за 7 дней: $messages7d
@@ -1415,7 +1370,7 @@ class TelegramLongPolling(
         }
 
         if (!snapshot.existsInUsers) {
-            runCatching { UsersRepo.touch(targetId) }
+            runCatching { UsersRepo.recordSeen(targetId) }
                 .onFailure {
                     println("ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=touch_failed err=${it.message}")
                 }
@@ -1433,7 +1388,7 @@ class TelegramLongPolling(
 
         val untilDisplay = until?.let { dtf.format(Instant.ofEpochMilli(it)) } ?: "—"
         api.sendMessage(chatId, "Премиум пользователю $targetId активен до: $untilDisplay", parseMode = null)
-        runCatching { UsersRepo.touch(targetId) }
+        runCatching { UsersRepo.recordSeen(targetId) }
             .onFailure {
                 println(
                     "ADMIN-GRANT-ERR: requester=$adminId target=$targetId days=$days source=$source reason=touch_failed err=${it.message}"
@@ -1476,10 +1431,11 @@ class TelegramLongPolling(
             broadcastJob = GlobalScope.launch {
                 try {
                     val audience = runCatching {
+                        val snapshot = StatsService.collect()
                         BroadcastAudience(
-                            totalUsers = UsersRepo.countUsers(includeBlocked = true),
-                            activeUsers = UsersRepo.countUsers(includeBlocked = false),
-                            blockedUsers = UsersRepo.countBlocked()
+                            totalUsers = snapshot.total,
+                            activeUsers = snapshot.activeInstalls,
+                            blockedUsers = snapshot.blocked
                         )
                     }
                         .onFailure {
@@ -1531,6 +1487,7 @@ class TelegramLongPolling(
                             when (outcome.result) {
                                 BroadcastResult.SENT -> {
                                     sentRecipients++
+                                    UserService.markInteraction(recipient, "broadcast")
                                     println("BCAST-SEND ok user=$recipient")
                                 }
                                 BroadcastResult.BLOCKED -> {
@@ -1768,7 +1725,7 @@ class TelegramLongPolling(
 
     private fun markRecipientBlocked(recipient: Long, code: Int?, description: String?) {
         val reason = sanitizeLogValue(description) ?: "unknown"
-        markUserBlocked(recipient, "broadcast", reason = reason)
+        UserService.markBlocked(recipient, "broadcast", reason = reason)
         val codeLabel = code?.toString() ?: "unknown"
         println("BROADCAST-USER-BLOCKED: user_id=$recipient code=$codeLabel reason=$reason")
     }
@@ -1776,21 +1733,7 @@ class TelegramLongPolling(
     private fun sendAdminStats(chatId: Long) {
         runCatching { UsersRepo.repairOrphans(source = "admin_stats") }
             .onFailure { println("ADMIN-STATS-ERR: repair_users ${it.message}") }
-        val stats = runCatching {
-            val usersTotal = UsersRepo.countUsers(includeBlocked = true)
-            val usersActive = UsersRepo.countUsers(includeBlocked = false)
-            val blockedUsers = UsersRepo.countBlocked()
-            val premium = PremiumRepo.countActive()
-            val active7d = MessagesRepo.countActiveSince(
-                System.currentTimeMillis() - 7L * DAY_MS,
-                onlyActiveUsers = true
-            )
-            println(
-                "ADMIN-STATS-SRC: users_total=$usersTotal users_active=$usersActive " +
-                    "users_blocked=$blockedUsers premium_active=$premium active7d=$active7d"
-            )
-            AdminStatsSnapshot(usersTotal, usersActive, blockedUsers, premium, active7d)
-        }.getOrElse {
+        val stats = runCatching { StatsService.collect() }.getOrElse {
             println("ADMIN-STATS-ERR: ${it.message}")
             api.sendMessage(chatId, "Не удалось получить статистику. Проверьте логи.", parseMode = null)
             return
@@ -1800,7 +1743,10 @@ class TelegramLongPolling(
         val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
         val premium = stats.premium.coerceAtLeast(0L)
         val active7d = stats.active7d.coerceAtLeast(0L)
-        println("ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
+        println(
+            "ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium " +
+                "active7d=$active7d blocked=$blocked"
+        )
         val message = buildString {
             appendLine("Статистика:")
             appendLine("• Установок бота: $total")

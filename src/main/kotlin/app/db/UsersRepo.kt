@@ -11,6 +11,7 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.Op
 import org.jetbrains.exposed.sql.SortOrder
@@ -25,6 +26,7 @@ object UsersRepo {
     data class UserInfo(
         val userId: Long,
         val firstSeen: Long,
+        val lastSeen: Long,
         val blockedTs: Long,
         val blocked: Boolean,
     )
@@ -32,23 +34,62 @@ object UsersRepo {
     data class UserSnapshot(
         val userId: Long,
         val firstSeen: Long?,
+        val lastSeen: Long?,
         val blockedTs: Long,
         val existsInUsers: Boolean,
         val blocked: Boolean,
     )
 
-    fun touch(userId: Long, now: Long = System.currentTimeMillis()): Boolean = transaction {
+    data class SeenRecordResult(
+        val inserted: Boolean,
+        val updated: Boolean,
+    )
+
+    fun recordSeen(userId: Long, now: Long = System.currentTimeMillis()): SeenRecordResult = transaction {
+        if (userId <= 0L) return@transaction SeenRecordResult(inserted = false, updated = false)
         val inserted = Users.insertIgnore {
             it[Users.user_id] = userId
             it[Users.first_seen] = now
+            it[Users.last_seen] = now
             it[Users.blocked_ts] = 0L
             it[Users.blocked] = false
         }
-        if (inserted.insertedCount > 0) return@transaction true
-        Users.update({ (Users.user_id eq userId) and (Users.first_seen eq 0L) }) {
-            it[Users.first_seen] = now
-        } > 0
+        if (inserted.insertedCount > 0) {
+            return@transaction SeenRecordResult(inserted = true, updated = true)
+        }
+
+        val existing = Users
+            .slice(Users.first_seen, Users.last_seen)
+            .select { Users.user_id eq userId }
+            .limit(1)
+            .firstOrNull()
+            ?: return@transaction SeenRecordResult(inserted = false, updated = false)
+
+        val currentFirst = existing[Users.first_seen]
+        val desiredFirst = when {
+            currentFirst <= 0L -> now
+            now < currentFirst -> now
+            else -> currentFirst
+        }
+        val needsFirstUpdate = desiredFirst != currentFirst
+        val currentLast = existing[Users.last_seen]
+        val needsLastUpdate = currentLast <= 0L || currentLast < now
+        if (!needsFirstUpdate && !needsLastUpdate) {
+            return@transaction SeenRecordResult(inserted = false, updated = false)
+        }
+
+        Users.update({ Users.user_id eq userId }) { row ->
+            if (needsFirstUpdate) {
+                row[Users.first_seen] = desiredFirst
+            }
+            row[Users.last_seen] = now
+        }
+
+        SeenRecordResult(inserted = false, updated = true)
     }
+
+    fun touch(userId: Long, now: Long = System.currentTimeMillis()): Boolean =
+        recordSeen(userId, now).inserted
 
     fun getAllUserIds(includeBlocked: Boolean = false): List<Long> = transaction {
         val query = if (includeBlocked) {
@@ -71,6 +112,13 @@ object UsersRepo {
     fun countBlocked(): Long = transaction {
         Users
             .select { blockedUsersCondition() }
+            .count()
+            .toLong()
+    }
+
+    fun countActiveSince(fromMs: Long): Long = transaction {
+        Users
+            .select { activeUsersCondition() and (Users.last_seen greaterEq fromMs) }
             .count()
             .toLong()
     }
@@ -109,6 +157,7 @@ object UsersRepo {
                 UserInfo(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen],
+                    lastSeen = it[Users.last_seen],
                     blockedTs = normalizedBlockedTs,
                     blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
                 )
@@ -125,6 +174,7 @@ object UsersRepo {
                 return@transaction UserSnapshot(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
+                    lastSeen = it[Users.last_seen].takeIf { ts -> ts > 0L },
                     blockedTs = normalizedBlockedTs,
                     existsInUsers = true,
                     blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
@@ -139,6 +189,7 @@ object UsersRepo {
         UserSnapshot(
             userId = userId,
             firstSeen = resolvedTs?.takeIf { it > 0L },
+            lastSeen = null,
             blockedTs = 0L,
             existsInUsers = false,
             blocked = false,
@@ -161,6 +212,7 @@ object UsersRepo {
         val inserted = Users.insertIgnore {
             it[Users.user_id] = userId
             it[Users.first_seen] = now
+            it[Users.last_seen] = now
             it[Users.blocked_ts] = value
             it[Users.blocked] = blocked
         }
@@ -352,6 +404,7 @@ object UsersRepo {
         val insert = Users.insertIgnore {
             it[Users.user_id] = userId
             it[Users.first_seen] = firstSeenValue
+            it[Users.last_seen] = firstSeenValue
             it[Users.blocked_ts] = 0L
             it[Users.blocked] = false
         }
@@ -366,6 +419,7 @@ object UsersRepo {
             ?: return EnsureResult(success = false, inserted = false)
 
         val existingFirst = row[Users.first_seen]
+        val existingLast = row[Users.last_seen]
         val desiredFirst = when {
             resolvedTs != null && resolvedTs > 0L && existingFirst > 0L -> min(existingFirst, resolvedTs)
             resolvedTs != null && resolvedTs > 0L -> resolvedTs
@@ -373,9 +427,15 @@ object UsersRepo {
             else -> now
         }
         val needsFirstUpdate = desiredFirst != existingFirst
-        if (needsFirstUpdate) {
+        val needsLastUpdate = existingLast <= 0L
+        if (needsFirstUpdate || needsLastUpdate) {
             Users.update({ Users.user_id eq userId }) { update ->
-                update[Users.first_seen] = desiredFirst
+                if (needsFirstUpdate) {
+                    update[Users.first_seen] = desiredFirst
+                }
+                if (needsLastUpdate) {
+                    update[Users.last_seen] = desiredFirst
+                }
             }
         }
         return EnsureResult(success = true, inserted = false)

@@ -2,7 +2,7 @@ package app
 
 import app.db.DatabaseFactory
 import app.llm.OpenAIClient
-import app.web.TelegramLongPolling
+import app.telegram.TelegramLongPolling
 import kotlinx.coroutines.runBlocking
 
 private fun mask(s: String, head: Int = 4, tail: Int = 4): String =
