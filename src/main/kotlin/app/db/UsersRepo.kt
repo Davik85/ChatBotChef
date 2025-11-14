@@ -299,11 +299,7 @@ object UsersRepo {
         return result
     }
 
-    private fun Transaction.ensureUserInternal(
-        userId: Long,
-        resolvedTs: Long?,
-        now: Long = System.currentTimeMillis(),
-    ): EnsureResult {
+    private fun Transaction.ensureUserInternal(userId: Long, resolvedTs: Long?, now: Long): EnsureResult {
         if (userId <= 0) return EnsureResult(success = false, inserted = false)
         val firstSeenValue = resolvedTs?.takeIf { it > 0L } ?: now
         val insert = Users.insertIgnore {
