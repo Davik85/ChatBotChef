@@ -128,7 +128,7 @@ class OpenAIClient(
                     val reply = parsed.choices.firstOrNull()?.message?.content?.trim()
                         .takeUnless { it.isNullOrBlank() }
                         ?: AppConfig.FALLBACK_REPLY
-                    return reply.take(AppConfig.MAX_REPLY_CHARS)
+                    return reply
                 }
                 if (shouldRetry) {
                     Thread.sleep(300L * attempt * attempt)
