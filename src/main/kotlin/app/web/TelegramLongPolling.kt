@@ -261,6 +261,45 @@ class TelegramLongPolling(
         }
     }
 
+    private fun markUserActive(userId: Long, reason: String) {
+        if (userId <= 0) return
+        runCatching {
+            val changed = UsersRepo.markBlocked(userId, blocked = false)
+            if (changed) {
+                println("USERS-UNBLOCK: user=$userId source=$reason")
+            }
+        }.onFailure {
+            println("USERS-UNBLOCK-ERR: user=$userId source=$reason reason=${it.message}")
+        }
+    }
+
+    private fun markUserBlocked(userId: Long, reason: String, status: String? = null) {
+        if (userId <= 0) return
+        runCatching {
+            val changed = UsersRepo.markBlocked(userId, blocked = true)
+            if (changed) {
+                val statusPart = status?.let { " status=$it" } ?: ""
+                println("USERS-BLOCK: user=$userId source=$reason$statusPart")
+            }
+        }.onFailure {
+            println("USERS-BLOCK-ERR: user=$userId source=$reason reason=${it.message}")
+        }
+    }
+
+    private fun handleChatMemberUpdate(update: TgChatMemberUpdated, source: String) {
+        val chat = update.chat
+        val chatType = chat.type?.lowercase()
+        if (chatType != null && chatType != "private") {
+            return
+        }
+        val userId = chat.id
+        val newStatus = update.new_chat_member?.status?.lowercase() ?: return
+        when (newStatus) {
+            "kicked", "left" -> markUserBlocked(userId, "chat_member:$source", newStatus)
+            "member", "administrator", "creator" -> markUserActive(userId, "chat_member:$source:$newStatus")
+        }
+    }
+
     private fun upsertUser(from: TgUser?, source: String) {
         val user = from ?: return
         val now = System.currentTimeMillis()
@@ -309,6 +348,9 @@ class TelegramLongPolling(
                     u.my_chat_member?.from?.let { upsertUser(it, "chat_member") }
                     u.chat_member?.from?.let { upsertUser(it, "chat_member") }
 
+                    u.my_chat_member?.let { handleChatMemberUpdate(it, "my_chat_member") }
+                    u.chat_member?.let { handleChatMemberUpdate(it, "chat_member") }
+
                     val handledSuccessfully = try {
                         val pcq = u.pre_checkout_query
                         if (pcq != null) {
@@ -352,6 +394,7 @@ class TelegramLongPolling(
     // ===== Payments =====
 
     private fun handlePreCheckout(q: TgPreCheckoutQuery) {
+        markUserActive(q.from.id, "pre_checkout")
         trackUserActivity(q.from.id, "[pre_checkout] ${q.invoice_payload ?: ""}")
         val validation = PaymentService.validatePreCheckout(q)
         if (!validation.ok) {
@@ -365,6 +408,7 @@ class TelegramLongPolling(
         val chatId = msg.chat.id
         val payment = msg.successful_payment ?: return
         val payerId = msg.from?.id ?: chatId
+        markUserActive(payerId, "successful_payment")
         val paymentId = payment.provider_payment_charge_id ?: payment.telegram_payment_charge_id ?: ""
         trackUserActivity(payerId, "[payment_success] $paymentId", role = "system")
         val recorded = PaymentService.handleSuccessfulPayment(chatId, payment)
@@ -421,6 +465,7 @@ class TelegramLongPolling(
         val msgId = cb.message.message_id
         val userId = cb.from.id
 
+        markUserActive(userId, "callback")
         trackUserActivity(userId, "[callback] ${cb.data.orEmpty()}")
 
         when (cb.data) {
@@ -552,6 +597,7 @@ class TelegramLongPolling(
         val msgId = msg.message_id
         val userId = msg.from?.id ?: chatId
 
+        markUserActive(userId, "message")
         val hasAttachments = (msg.photo?.isNotEmpty() == true) ||
             msg.document != null ||
             msg.video != null ||
@@ -1446,8 +1492,7 @@ class TelegramLongPolling(
     }
 
     private fun markRecipientBlocked(recipient: Long) {
-        runCatching { UsersRepo.markBlocked(recipient, blocked = true) }
-            .onFailure { println("BCAST-ERR mark_blocked_failed user=$recipient reason=${it.message}") }
+        markUserBlocked(recipient, "broadcast")
     }
 
     private fun sendAdminStats(chatId: Long) {
@@ -1471,7 +1516,7 @@ class TelegramLongPolling(
         val activeInstalls = stats.activeInstalls.coerceAtLeast(0L)
         val premium = stats.premium.coerceAtLeast(0L)
         val active7d = stats.active7d.coerceAtLeast(0L)
-        println("ADMIN-STATS-OK: total=$total premium=$premium active7d=$active7d blocked=$blocked")
+        println("ADMIN-STATS-OK: total=$total activeInstalls=$activeInstalls premium=$premium active7d=$active7d blocked=$blocked")
         val message = buildString {
             appendLine("Статистика:")
             appendLine("• Установок бота: $total")
