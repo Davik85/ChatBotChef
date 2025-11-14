@@ -1,13 +1,15 @@
 package app.db
 
+import org.jetbrains.exposed.sql.JoinType
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
+import org.jetbrains.exposed.sql.and
+import org.jetbrains.exposed.sql.countDistinct
 import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
-import org.jetbrains.exposed.sql.and
-import org.jetbrains.exposed.sql.countDistinct
 
 object MessagesRepo {
     private const val MAX_STORED_TEXT = 4000
@@ -39,15 +41,33 @@ object MessagesRepo {
         }
     }
 
-    fun countActiveSince(fromMs: Long): Long = transaction {
+    fun countActiveSince(fromMs: Long, onlyActiveUsers: Boolean = false): Long = transaction {
         val countExpr = Messages.user_id.countDistinct()
-        Messages
-            .slice(countExpr)
-            .select { (Messages.ts greater fromMs) and (Messages.role eq "user") }
-            .firstOrNull()
-            ?.get(countExpr)
-            ?.toLong()
-            ?: 0L
+        val baseCondition = (Messages.ts greater fromMs) and (Messages.role eq "user")
+        if (!onlyActiveUsers) {
+            Messages
+                .slice(countExpr)
+                .select { baseCondition }
+                .firstOrNull()
+                ?.get(countExpr)
+                ?.toLong()
+                ?: 0L
+        } else {
+            Messages
+                .join(
+                    Users,
+                    joinType = JoinType.INNER,
+                    additionalConstraint = { Messages.user_id eq Users.user_id }
+                )
+                .slice(countExpr)
+                .select {
+                    baseCondition and (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
+                }
+                .firstOrNull()
+                ?.get(countExpr)
+                ?.toLong()
+                ?: 0L
+        }
     }
 
     fun countUserMessagesSince(userId: Long, fromMs: Long): Long = transaction {
