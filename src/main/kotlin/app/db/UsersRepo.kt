@@ -128,6 +128,22 @@ object UsersRepo {
 
     fun markBlocked(userId: Long, blocked: Boolean, now: Long = System.currentTimeMillis()): Boolean = transaction {
         val value = if (blocked) now else 0L
+        val existing = Users
+            .slice(Users.blocked, Users.blocked_ts)
+            .select { Users.user_id eq userId }
+            .limit(1)
+            .firstOrNull()
+            ?: return@transaction false
+
+        val currentBlocked = existing[Users.blocked]
+        val currentBlockedTs = existing[Users.blocked_ts]
+        val shouldUpdate = when {
+            blocked -> !currentBlocked || currentBlockedTs != value
+            else -> currentBlocked || currentBlockedTs != 0L
+        }
+
+        if (!shouldUpdate) return@transaction false
+
         Users.update({ Users.user_id eq userId }) { row ->
             row[Users.blocked_ts] = value
             row[Users.blocked] = blocked
