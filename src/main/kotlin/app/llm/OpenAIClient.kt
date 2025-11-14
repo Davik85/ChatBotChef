@@ -14,7 +14,7 @@ import java.time.Duration
 
 class OpenAIClient(
     private val apiKey: String,
-    private val model: String = "gpt-4.1",
+    private val model: String = "gpt-5.1",
     // Use project-wide constant for long recipes
     private val maxCompletionTokens: Int = AppConfig.OPENAI_MAX_TOKENS,
     /** Для моделей, которые поддерживают. Для 4.1/omni/o4 не отправляем вовсе. */
@@ -75,7 +75,7 @@ class OpenAIClient(
     }
 
     /**
-     * Chat Completions (/v1/chat/completions) c model=gpt-4.1.
+     * Chat Completions (/v1/chat/completions) c model=gpt-5.1.
      * Отправляем max_tokens. temperature — только если поддерживается.
      */
     fun complete(messages: List<ChatMessage>): String {
@@ -144,7 +144,7 @@ class OpenAIClient(
     private fun supportsTemperature(model: String): Boolean {
         val m = model.lowercase()
         // семейства, где temperature сейчас НЕ поддерживается в /chat/completions
-        val noTemp = m.startsWith("gpt-4.1") || m.startsWith("o4") || m.contains("omni")
+        val noTemp = m.startsWith("gpt-5.1") || m.startsWith("o4") || m.contains("omni")
         return !noTemp
     }
 }
