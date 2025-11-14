@@ -320,16 +320,23 @@ class TelegramLongPolling(
         var offset: Long = lastProcessedId + 1
         println("OFFSET init last_id=$lastProcessedId offset=$offset")
 
+        var conflictLogged = false
         while (true) {
             try {
                 val updates: List<TgUpdate> = try {
                     api.getUpdates(offset)
                 } catch (conflict: TelegramPollingConflictException) {
-                    println(
-                        "TG-POLL-CONFLICT: code=${conflict.statusCode} body=${conflict.body}"
-                    )
+                    if (!conflictLogged) {
+                        println(
+                            "TG-POLL-CONFLICT: code=${conflict.statusCode} body=${conflict.body}"
+                        )
+                        conflictLogged = true
+                    }
                     delay(5000)
                     continue
+                }
+                if (conflictLogged) {
+                    conflictLogged = false
                 }
                 if (updates.isEmpty()) { delay(1200); continue }
 
