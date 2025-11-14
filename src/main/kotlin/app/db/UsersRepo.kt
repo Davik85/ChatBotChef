@@ -13,6 +13,7 @@ import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
 import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.Op
+import org.jetbrains.exposed.sql.SortOrder
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -72,6 +73,22 @@ object UsersRepo {
             .select { blockedUsersCondition() }
             .count()
             .toLong()
+    }
+
+    fun loadActiveBatch(afterUserId: Long? = null, limit: Int): List<Long> = transaction {
+        if (limit <= 0) return@transaction emptyList()
+        Users
+            .slice(Users.user_id)
+            .select {
+                if (afterUserId != null && afterUserId > 0) {
+                    (Users.user_id greater afterUserId) and activeUsersCondition()
+                } else {
+                    activeUsersCondition()
+                }
+            }
+            .orderBy(Users.user_id to SortOrder.ASC)
+            .limit(limit)
+            .map { it[Users.user_id] }
     }
 
     fun exists(userId: Long): Boolean = transaction {
