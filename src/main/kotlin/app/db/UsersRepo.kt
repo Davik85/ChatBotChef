@@ -88,11 +88,12 @@ object UsersRepo {
             .limit(1)
             .firstOrNull()
             ?.let {
+                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
                 UserInfo(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen],
-                    blockedTs = it[Users.blocked_ts],
-                    blocked = isRowBlocked(it[Users.blocked], it[Users.blocked_ts])
+                    blockedTs = normalizedBlockedTs,
+                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
                 )
             }
     }
@@ -103,12 +104,13 @@ object UsersRepo {
             .limit(1)
             .firstOrNull()
             ?.let {
+                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
                 return@transaction UserSnapshot(
                     userId = it[Users.user_id],
                     firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
-                    blockedTs = it[Users.blocked_ts],
+                    blockedTs = normalizedBlockedTs,
                     existsInUsers = true,
-                    blocked = isRowBlocked(it[Users.blocked], it[Users.blocked_ts])
+                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
                 )
             }
 
@@ -430,6 +432,11 @@ object UsersRepo {
 
     private fun isRowBlocked(blockedFlag: Boolean, blockedTs: Long): Boolean =
         blockedFlag || blockedTs > 0L
+
+    private fun normalizeBlockedTimestamp(raw: Long): Long {
+        if (raw <= 0L) return 0L
+        return if (raw in 1_000_000_000L..4_000_000_000L) raw * 1000L else raw
+    }
 
     private fun parseUserId(rs: ResultSet, column: String = "user_id"): Long? {
         val raw = rs.getObject(column) ?: return null

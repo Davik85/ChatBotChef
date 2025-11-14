@@ -298,10 +298,39 @@ class TelegramLongPolling(
             return
         }
         val userId = chat.id
-        val newStatus = update.new_chat_member?.status?.lowercase() ?: return
-        when (newStatus) {
-            "kicked", "left" -> markUserBlocked(userId, "chat_member:$source", newStatus)
-            "member", "administrator", "creator" -> markUserActive(userId, "chat_member:$source:$newStatus")
+        val member = update.new_chat_member ?: return
+        val newStatus = member.status?.lowercase() ?: return
+        val isMember = member.is_member ?: when (newStatus) {
+            "member", "administrator", "creator" -> true
+            else -> false
+        }
+        val canSend = member.can_send_messages ?: when (newStatus) {
+            "kicked", "left" -> false
+            else -> true
+        }
+        val shouldBlock = when (newStatus) {
+            "kicked", "left" -> true
+            "restricted" -> !isMember || !canSend
+            else -> false
+        }
+        if (shouldBlock) {
+            val statusDetails = buildString {
+                append(newStatus)
+                append(" member=")
+                append(isMember)
+                append(" canSend=")
+                append(canSend)
+            }
+            markUserBlocked(userId, "chat_member:$source", statusDetails)
+            return
+        }
+        val shouldActivate = when (newStatus) {
+            "member", "administrator", "creator" -> true
+            "restricted" -> isMember && canSend
+            else -> false
+        }
+        if (shouldActivate) {
+            markUserActive(userId, "chat_member:$source:$newStatus")
         }
     }
 

@@ -223,7 +223,9 @@ data class TgUpdate(
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class TgChatMember(
     val status: String? = null,
-    val user: TgUser? = null
+    val user: TgUser? = null,
+    val is_member: Boolean? = null,
+    val can_send_messages: Boolean? = null
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
