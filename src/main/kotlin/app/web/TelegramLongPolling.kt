@@ -329,9 +329,13 @@ class TelegramLongPolling(
         val normalized = raw.lowercase()
         return normalized.contains("bot was blocked by the user") ||
             normalized.contains("user is deactivated") ||
+            normalized.contains("chat is deactivated") ||
             normalized.contains("chat not found") ||
             normalized.contains("chat_not_found") ||
+            normalized.contains("peer not found") ||
+            normalized.contains("peer_not_found") ||
             normalized.contains("user not found") ||
+            normalized.contains("user is deleted") ||
             normalized.contains("deleted account")
     }
 

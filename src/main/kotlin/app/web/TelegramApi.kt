@@ -54,8 +54,11 @@ class TelegramApi(private val token: String) {
         if (normalized.isNullOrBlank()) return false
         if (normalized.contains("bot was blocked by the user")) return true
         if (normalized.contains("user is deactivated")) return true
+        if (normalized.contains("chat is deactivated")) return true
         if (normalized.contains("chat not found") || normalized.contains("chat_not_found")) return code == 400 || code == 403
+        if (normalized.contains("peer not found") || normalized.contains("peer_not_found")) return code == 400 || code == 403
         if (normalized.contains("user not found")) return true
+        if (normalized.contains("user is deleted")) return true
         if (normalized.contains("deleted account")) return true
         return false
     }
