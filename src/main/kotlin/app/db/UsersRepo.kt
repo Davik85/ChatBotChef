@@ -15,7 +15,6 @@ import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
 import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.Op
 import org.jetbrains.exposed.sql.SortOrder
-import org.jetbrains.exposed.sql.count
 import java.sql.ResultSet
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -102,45 +101,57 @@ object UsersRepo {
     }
 
     fun countUsers(includeBlocked: Boolean = true): Long = transaction {
-        val countExpr = Users.user_id.count()
         val query = if (includeBlocked) {
-            Users.slice(countExpr).selectAll()
+            Users.selectAll()
         } else {
-            Users.slice(countExpr).select { activeUsersCondition() }
+            Users.select { activeUsersCondition() }
         }
-        query.firstOrNull()?.get(countExpr) ?: 0L
+        query.count().toLong()
     }
 
     fun countBlocked(): Long = transaction {
-        val countExpr = Users.user_id.count()
         Users
-            .slice(countExpr)
             .select { blockedUsersCondition() }
-            .firstOrNull()
-            ?.get(countExpr)
-            ?: 0L
+            .count()
+            .toLong()
     }
 
     fun countActiveSince(fromMs: Long): Long = transaction {
-        val countExpr = Users.user_id.count()
+        val threshold = fromMs.coerceAtLeast(0L)
         Users
-            .slice(countExpr)
-            .select { activeUsersCondition() and (Users.last_seen greaterEq fromMs) }
-            .firstOrNull()
-            ?.get(countExpr)
-            ?: 0L
+            .select { activeUsersCondition() and (Users.last_seen greaterEq threshold) }
+            .count()
+            .toLong()
     }
 
-    fun loadActiveBatch(afterUserId: Long? = null, limit: Int): List<Long> = transaction {
+    fun countActiveInstalls(fromMs: Long): Long = transaction {
+        val threshold = fromMs.coerceAtLeast(0L)
+        Users
+            .select {
+                if (threshold <= 0L) {
+                    activeUsersCondition()
+                } else {
+                    activeUsersCondition() and (Users.last_seen greaterEq threshold)
+                }
+            }
+            .count()
+            .toLong()
+    }
+
+    fun loadActiveBatch(afterUserId: Long? = null, limit: Int, activeSince: Long? = null): List<Long> = transaction {
         if (limit <= 0) return@transaction emptyList()
         Users
             .slice(Users.user_id)
             .select {
+                var condition: Op<Boolean> = activeUsersCondition()
                 if (afterUserId != null && afterUserId > 0) {
-                    (Users.user_id greater afterUserId) and activeUsersCondition()
-                } else {
-                    activeUsersCondition()
+                    condition = (Users.user_id greater afterUserId) and condition
                 }
+                val activeThreshold = activeSince?.takeIf { it > 0L }
+                if (activeThreshold != null) {
+                    condition = condition and (Users.last_seen greaterEq activeThreshold)
+                }
+                condition
             }
             .orderBy(Users.user_id to SortOrder.ASC)
             .limit(limit)
