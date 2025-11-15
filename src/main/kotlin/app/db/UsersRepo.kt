@@ -134,163 +134,135 @@ object UsersRepo {
     }
 
     fun countActiveInstalls(fromMs: Long): Long = transaction {
-        val threshold = fromMs.coerceAtLeast(0L)
         Users
-            .select {
-                if (threshold <= 0L) {
-                    activeUsersCondition()
-                } else {
-                    activeUsersCondition() and (Users.last_seen greaterEq threshold)
-                }
-            }
+            .select { activeUsersCondition() }
             .count()
             .toLong()
     }
 
     fun summarizeForStats(activeSince: Long): StatsSummary = transaction {
         val threshold = activeSince.coerceAtLeast(0L)
-        val unionParts = mutableListOf<String>()
+        data class Accumulator(var lastSeen: Long = 0L, var blockedTs: Long = 0L, var blockedFlag: Boolean = false)
 
-        fun addPart(sql: String) {
-            if (sql.isNotBlank()) {
-                unionParts += sql
-            }
-        }
+        val users = linkedMapOf<Long, Accumulator>()
+        var sourcesUsed = 0
+
+        fun ensureUser(id: Long): Accumulator = users.getOrPut(id) { Accumulator() }
 
         if (tableExists("users") && columnExists("users", "user_id")) {
-            val lastSeenExpr = if (columnExists("users", "last_seen")) "COALESCE(last_seen, 0)" else "0"
-            val blockedTsExpr = if (columnExists("users", "blocked_ts")) "COALESCE(blocked_ts, 0)" else "0"
-            val blockedExpr = if (columnExists("users", "blocked")) {
-                "CASE WHEN COALESCE(blocked, 0) != 0 THEN 1 ELSE 0 END"
-            } else {
-                "0"
-            }
-            addPart(
-                """
-                SELECT CAST(user_id AS INTEGER) AS user_id,
-                       $lastSeenExpr AS last_seen,
-                       $blockedTsExpr AS blocked_ts,
-                       $blockedExpr AS blocked_flag
-                FROM users
-                WHERE user_id IS NOT NULL
-                  AND TRIM(CAST(user_id AS TEXT)) != ''
-                """.trimIndent()
-            )
+            sourcesUsed += 1
+            Users
+                .slice(Users.user_id, Users.last_seen, Users.blocked_ts, Users.blocked)
+                .selectAll()
+                .forEach { row ->
+                    val id = row[Users.user_id]
+                    val acc = ensureUser(id)
+                    val lastSeen = row[Users.last_seen]
+                    if (lastSeen > acc.lastSeen) acc.lastSeen = lastSeen
+                    val blockedTs = row[Users.blocked_ts]
+                    if (blockedTs > acc.blockedTs) acc.blockedTs = blockedTs
+                    if (row[Users.blocked]) acc.blockedFlag = true
+                }
         }
 
-        fun addTimestampSource(table: String, tsColumn: String) {
+        fun mergeTimestampSource(table: String, tsColumn: String) {
             if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, tsColumn)) return
-            addPart(
-                """
-                SELECT CAST(user_id AS INTEGER) AS user_id,
-                       MAX(COALESCE($tsColumn, 0)) AS last_seen,
-                       0 AS blocked_ts,
-                       0 AS blocked_flag
+            sourcesUsed += 1
+            val sql = """
+                SELECT user_id, MAX(COALESCE($tsColumn, 0)) AS last_seen
                 FROM $table
                 WHERE user_id IS NOT NULL
                   AND TRIM(CAST(user_id AS TEXT)) != ''
-                GROUP BY CAST(user_id AS INTEGER)
-                """.trimIndent()
-            )
+                GROUP BY user_id
+            """.trimIndent()
+            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
+                while (rs?.next() == true) {
+                    val id = parseUserId(rs) ?: continue
+                    val last = parseEpoch(rs.getObject("last_seen")) ?: 0L
+                    val acc = ensureUser(id)
+                    if (last > acc.lastSeen) acc.lastSeen = last
+                }
+            }
         }
 
-        fun addPlainSource(table: String) {
+        fun mergePlainSource(table: String) {
             if (!tableExists(table) || !columnExists(table, "user_id")) return
-            addPart(
-                """
-                SELECT CAST(user_id AS INTEGER) AS user_id,
-                       0 AS last_seen,
-                       0 AS blocked_ts,
-                       0 AS blocked_flag
+            sourcesUsed += 1
+            val sql = """
+                SELECT user_id
                 FROM $table
                 WHERE user_id IS NOT NULL
                   AND TRIM(CAST(user_id AS TEXT)) != ''
-                """.trimIndent()
-            )
+            """.trimIndent()
+            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
+                while (rs?.next() == true) {
+                    val id = parseUserId(rs) ?: continue
+                    ensureUser(id)
+                }
+            }
         }
 
-        fun addStatsDaySource(table: String, dayColumn: String) {
+        fun mergeStatsDay(table: String, dayColumn: String) {
             if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, dayColumn)) return
-            addPart(
-                """
-                SELECT CAST(user_id AS INTEGER) AS user_id,
-                       COALESCE(CAST(strftime('%s', $dayColumn || ' 00:00:00') AS INTEGER) * 1000, 0) AS last_seen,
-                       0 AS blocked_ts,
-                       0 AS blocked_flag
+            sourcesUsed += 1
+            val sql = """
+                SELECT user_id, $dayColumn AS day
                 FROM $table
                 WHERE user_id IS NOT NULL
                   AND TRIM(CAST(user_id AS TEXT)) != ''
                   AND $dayColumn IS NOT NULL
-                  AND TRIM($dayColumn) != ''
-                """.trimIndent()
-            )
+            """.trimIndent()
+            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
+                while (rs?.next() == true) {
+                    val id = parseUserId(rs) ?: continue
+                    val day = parseStatsDay(rs.getString("day")) ?: continue
+                    val acc = ensureUser(id)
+                    if (day > acc.lastSeen) acc.lastSeen = day
+                }
+            }
         }
 
-        addTimestampSource("messages", "ts")
-        addTimestampSource("chat_history", "ts")
-        addTimestampSource("memory_notes_v2", "ts")
-        addTimestampSource("premium_reminders", "sent_ts")
-        addTimestampSource("payments", "created_at")
-        addPlainSource("usage_counters")
-        addPlainSource("premium_users")
-        addStatsDaySource("user_stats", "day")
+        mergeTimestampSource("messages", "ts")
+        mergeTimestampSource("chat_history", "ts")
+        mergeTimestampSource("memory_notes_v2", "ts")
+        mergeTimestampSource("premium_reminders", "sent_ts")
+        mergeTimestampSource("payments", "created_at")
+        mergePlainSource("usage_counters")
+        mergePlainSource("premium_users")
+        mergeStatsDay("user_stats", "day")
 
-        if (unionParts.isEmpty()) {
+        val total = users.size.toLong()
+        if (total == 0L) {
             return@transaction StatsSummary(
                 totalUsers = 0,
                 blockedUsers = 0,
                 activeUsers = 0,
-                sourcesUsed = 0,
+                sourcesUsed = sourcesUsed,
                 activeWindowPopulation = 0,
             )
         }
 
-        val unionSql = unionParts.joinToString(separator = "\nUNION ALL\n")
-        val sql = """
-            WITH aggregated AS (
-                SELECT
-                    user_id,
-                    MAX(last_seen) AS last_seen,
-                    MAX(blocked_ts) AS blocked_ts,
-                    MAX(blocked_flag) AS blocked_flag
-                FROM (
-                    $unionSql
-                )
-                WHERE user_id IS NOT NULL AND user_id > 0
-                GROUP BY user_id
-            )
-            SELECT
-                COALESCE(COUNT(1), 0) AS total,
-                COALESCE(SUM(CASE WHEN blocked_flag = 1 OR blocked_ts > 0 THEN 1 ELSE 0 END), 0) AS blocked,
-                COALESCE(SUM(CASE
-                    WHEN blocked_flag = 1 OR blocked_ts > 0 THEN 0
-                    WHEN last_seen >= $threshold THEN 1
-                    ELSE 0
-                END), 0) AS active,
-                COALESCE(SUM(CASE WHEN last_seen >= $threshold THEN 1 ELSE 0 END), 0) AS active_window_population
-            FROM aggregated
-        """.trimIndent()
-
-        val summary = exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
-            if (rs?.next() == true) {
-                StatsSummary(
-                    totalUsers = rs.getLongOrZero("total"),
-                    blockedUsers = rs.getLongOrZero("blocked"),
-                    activeUsers = rs.getLongOrZero("active"),
-                    sourcesUsed = unionParts.size,
-                    activeWindowPopulation = rs.getLongOrZero("active_window_population"),
-                )
-            } else {
-                null
+        var blocked = 0L
+        var active = 0L
+        var activeWindow = 0L
+        users.values.forEach { acc ->
+            val isBlocked = acc.blockedFlag || acc.blockedTs > 0L
+            if (isBlocked) {
+                blocked += 1
+            } else if (acc.lastSeen >= threshold) {
+                active += 1
+            }
+            if (acc.lastSeen >= threshold) {
+                activeWindow += 1
             }
         }
 
-        summary ?: StatsSummary(
-            totalUsers = 0,
-            blockedUsers = 0,
-            activeUsers = 0,
-            sourcesUsed = unionParts.size,
-            activeWindowPopulation = 0,
+        StatsSummary(
+            totalUsers = total,
+            blockedUsers = blocked,
+            activeUsers = active,
+            sourcesUsed = sourcesUsed,
+            activeWindowPopulation = activeWindow,
         )
     }
 
@@ -753,28 +725,24 @@ object UsersRepo {
         return if (wasNull()) 0L else value
     }
 
-    private fun Transaction.tableExists(name: String): Boolean =
-        exec(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='$name'",
-            explicitStatementType = StatementType.SELECT
-        ) { rs ->
-            var found = false
-            while (rs?.next() == true) found = true
-            found
-        } ?: false
+    private fun Transaction.tableExists(name: String): Boolean {
+        val normalized = name.trim().ifBlank { return false }
+        return try {
+            exec("SELECT 1 FROM $normalized LIMIT 1", explicitStatementType = StatementType.SELECT) { true }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
 
-    private fun Transaction.columnExists(table: String, column: String): Boolean =
-        exec(
-            "PRAGMA table_info($table)",
-            explicitStatementType = StatementType.SELECT
-        ) { rs ->
-            var ok = false
-            while (rs?.next() == true) {
-                if (rs.getString("name") == column) {
-                    ok = true
-                    break
-                }
-            }
-            ok
-        } ?: false
+    private fun Transaction.columnExists(table: String, column: String): Boolean {
+        val tableName = table.trim().ifBlank { return false }
+        val columnName = column.trim().ifBlank { return false }
+        return try {
+            exec("SELECT $columnName FROM $tableName LIMIT 1", explicitStatementType = StatementType.SELECT) { true }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
 }
