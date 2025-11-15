@@ -137,30 +137,6 @@ object UsersRepo {
             .select { activeUsersCondition() }
             .count()
             .toLong()
-    }
-
-    fun summarizeForStats(activeSince: Long): StatsSummary = transaction {
-        val total = Users
-            .selectAll()
-            .count()
-            .toLong()
-        val blocked = Users
-            .select { blockedUsersCondition() }
-            .count()
-            .toLong()
-            .coerceAtMost(total)
-        val activeInstalls = (total - blocked).coerceAtLeast(0L)
-        val threshold = activeSince.coerceAtLeast(0L)
-        val activeWindowPopulation = Users
-            .select {
-                if (threshold <= 0L) {
-                    activeUsersCondition()
-                } else {
-                    activeUsersCondition() and (Users.last_seen greaterEq threshold)
-                }
-            }
-            .count()
-            .toLong()
         StatsSummary(
             totalUsers = total,
             blockedUsers = blocked,

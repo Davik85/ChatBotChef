@@ -23,7 +23,7 @@ object StatsService {
         val userSummary = UsersRepo.summarizeForStats(threshold)
         val total = userSummary.totalUsers
         val blocked = userSummary.blockedUsers.coerceAtMost(total)
-        val activeInstalls = userSummary.activeInstalls.coerceAtMost(total)
+        val activeInstalls = (total - blocked).coerceAtLeast(0L)
         val premium = PremiumRepo.countActive(now)
         val active7dThreshold = now - 7 * DAY_MS
         val active7d = UsersRepo.countActiveSince(active7dThreshold).coerceAtLeast(0L)
@@ -31,6 +31,8 @@ object StatsService {
             "ADMIN-STATS-DBG: users_total=$total users_blocked=$blocked " +
                 "users_active_installs=$activeInstalls window_from=$threshold " +
                 "users_active_window=${userSummary.activeWindowPopulation} " +
+                "users_recent_active=${userSummary.activeUsers} " +
+                "sources=${userSummary.sourcesUsed} " +
                 "premium_active=$premium users_active7d=$active7d"
         )
         return Snapshot(
@@ -43,8 +45,9 @@ object StatsService {
     }
 
     /**
-     * Срезы статистики строятся на базе таблицы `users`:
-     * - UsersRepo.summarizeForStats() возвращает общий пул установок, заблокированных и активных (не заблокированных);
+     * Срезы статистики строятся на базе объединения данных из `users` и вспомогательных таблиц:
+     * - UsersRepo.summarizeForStats() агрегирует user_id из users/messages/chat_history, premium_* таблиц и usage_counters,
+     *   чтобы total/blocked/activeInstalls учитывали всех, кто взаимодействовал с ботом, даже если users ещё не заполнена;
      * - активные за 7 дней считаются по `users.last_seen`, чтобы учитывать только актуальные, незаблокированные аккаунты;
      * - количество премиум-пользователей берётся из таблицы premium_users через PremiumRepo.
      */

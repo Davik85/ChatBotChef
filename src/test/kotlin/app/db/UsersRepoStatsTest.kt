@@ -15,12 +15,12 @@ class UsersRepoStatsTest {
     fun setUp() {
         Database.connect("jdbc:sqlite::memory:")
         TransactionManager.manager.defaultIsolationLevel = java.sql.Connection.TRANSACTION_SERIALIZABLE
-        transaction { SchemaUtils.create(Users) }
+        transaction { SchemaUtils.create(Users, UsageCounters) }
     }
 
     @After
     fun tearDown() {
-        transaction { SchemaUtils.drop(Users) }
+        transaction { SchemaUtils.drop(UsageCounters, Users) }
         TransactionManager.resetCurrent(null)
     }
 
@@ -34,12 +34,20 @@ class UsersRepoStatsTest {
         UsersRepo.recordSeen(1003L, now)
         UsersRepo.markBlocked(1003L, blocked = true, now = now)
 
+        transaction {
+            UsageCounters.insert {
+                it[user_id] = 2001L
+                it[total_used] = 5
+            }
+        }
+
         val summary = UsersRepo.summarizeForStats(now - dayMs)
 
-        assertEquals(3L, summary.totalUsers)
+        assertEquals(4L, summary.totalUsers)
         assertEquals(1L, summary.blockedUsers)
-        assertEquals(2L, summary.activeInstalls)
-        assertEquals(1L, summary.activeWindowPopulation)
+        assertEquals(1L, summary.activeUsers)
+        assertEquals(2, summary.sourcesUsed)
+        assertEquals(2L, summary.activeWindowPopulation)
 
         val active7d = UsersRepo.countActiveSince(now - 7 * dayMs)
         assertEquals(1L, active7d)
