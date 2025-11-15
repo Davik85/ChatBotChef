@@ -20,27 +20,27 @@ object PremiumRepo {
 
     fun getUntil(userId: Long): Long? = transaction {
         PremiumUsers
-            .slice(PremiumUsers.until_ts)
-            .select { PremiumUsers.user_id eq userId }
+            .slice(PremiumUsers.premiumUntil)
+            .select { PremiumUsers.userId eq userId }
             .limit(1)
             .firstOrNull()
-            ?.get(PremiumUsers.until_ts)
+            ?.get(PremiumUsers.premiumUntil)
     }
 
     fun grantDays(userId: Long, days: Int) = transaction {
         val now = System.currentTimeMillis()
-        val cur = getUntil(userId) ?: now
-        val base = max(cur, now)
+        val currentUntil = getUntil(userId) ?: now
+        val base = max(currentUntil, now)
         val plus = days.coerceAtLeast(1) * 24L * 60L * 60L * 1000L
         val newUntil = base + plus
 
-        val updated = PremiumUsers.update({ PremiumUsers.user_id eq userId }) {
-            it[until_ts] = newUntil
+        val updated = PremiumUsers.update({ PremiumUsers.userId eq userId }) {
+            it[premiumUntil] = newUntil
         }
         if (updated == 0) {
             PremiumUsers.insert {
-                it[PremiumUsers.user_id] = userId
-                it[until_ts] = newUntil
+                it[PremiumUsers.userId] = userId
+                it[premiumUntil] = newUntil
             }
         }
         PremiumReminders.deleteWhere { PremiumReminders.user_id eq userId }
@@ -55,7 +55,7 @@ object PremiumRepo {
         PremiumReminders.insert {
             it[PremiumReminders.user_id] = userId
             it[PremiumReminders.kind] = kind
-            it[sent_ts] = System.currentTimeMillis()
+            it[PremiumReminders.sent_ts] = System.currentTimeMillis()
         }
         true
     }
@@ -63,17 +63,17 @@ object PremiumRepo {
     fun forEachExpiringInWindow(fromMs: Long, toMs: Long, cb: (Long, Long) -> Unit) {
         transaction {
             PremiumUsers
-                .slice(PremiumUsers.user_id, PremiumUsers.until_ts)
-                .select { PremiumUsers.until_ts.between(fromMs, toMs) }
+                .slice(PremiumUsers.userId, PremiumUsers.premiumUntil)
+                .select { PremiumUsers.premiumUntil.between(fromMs, toMs) }
                 .forEach { row ->
-                    cb(row[PremiumUsers.user_id], row[PremiumUsers.until_ts])
+                    cb(row[PremiumUsers.userId], row[PremiumUsers.premiumUntil])
                 }
         }
     }
 
     fun countActive(now: Long = System.currentTimeMillis()): Long = transaction {
         PremiumUsers
-            .select { PremiumUsers.until_ts.greater(now) }
+            .select { PremiumUsers.premiumUntil.greater(now) }
             .count()
     }
 }

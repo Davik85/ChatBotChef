@@ -1,35 +1,27 @@
 package app.db
 
-import org.jetbrains.exposed.sql.SqlExpressionBuilder
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
-import org.jetbrains.exposed.sql.Transaction
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
+import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
+import org.jetbrains.exposed.sql.SortOrder
 import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.insertIgnore
 import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
-import org.jetbrains.exposed.sql.statements.StatementType
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.greater
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.lessEq
-import org.jetbrains.exposed.sql.SqlExpressionBuilder.greaterEq
-import org.jetbrains.exposed.sql.or
-import org.jetbrains.exposed.sql.Op
-import org.jetbrains.exposed.sql.SortOrder
-import java.sql.ResultSet
-import java.time.LocalDate
-import java.time.ZoneOffset
-import java.time.format.DateTimeFormatter
-import kotlin.math.min
 
 object UsersRepo {
 
-    data class UserInfo(
-        val userId: Long,
-        val firstSeen: Long,
-        val lastSeen: Long,
-        val blockedTs: Long,
-        val blocked: Boolean,
+    data class SeenRecordResult(
+        val inserted: Boolean,
+        val updated: Boolean,
+    )
+
+    data class MarkBlockedResult(
+        val changed: Boolean,
+        val previousBlocked: Boolean,
+        val currentBlocked: Boolean,
     )
 
     data class UserSnapshot(
@@ -39,329 +31,71 @@ object UsersRepo {
         val blockedTs: Long,
         val existsInUsers: Boolean,
         val blocked: Boolean,
+        val languageCode: String?,
     )
 
-    data class SeenRecordResult(
-        val inserted: Boolean,
-        val updated: Boolean,
-    )
-
-    data class StatsSummary(
-        val totalUsers: Long,
-        val blockedUsers: Long,
-        val activeInstalls: Long,
-        val sourcesUsed: Int,
-        val activeWindowPopulation: Long,
-    )
-
-    fun recordSeen(userId: Long, now: Long = System.currentTimeMillis()): SeenRecordResult = transaction {
+    fun recordSeen(
+        userId: Long,
+        now: Long = System.currentTimeMillis(),
+        languageCode: String? = null
+    ): SeenRecordResult = transaction {
         if (userId <= 0L) return@transaction SeenRecordResult(inserted = false, updated = false)
-        val inserted = Users.insertIgnore {
-            it[Users.user_id] = userId
-            it[Users.first_seen] = now
-            it[Users.last_seen] = now
-            it[Users.blocked_ts] = 0L
-            it[Users.blocked] = false
+        val sanitizedLanguage = languageCode?.trim()?.takeIf { it.isNotEmpty() }?.take(16)
+
+        val inserted = Users.insertIgnore { row ->
+            row[Users.userId] = userId
+            row[Users.firstSeenAt] = now
+            row[Users.lastSeenAt] = now
+            row[Users.isBlocked] = false
+            row[Users.blockedAt] = null
+            row[Users.languageCode] = sanitizedLanguage
         }
         if (inserted.insertedCount > 0) {
             return@transaction SeenRecordResult(inserted = true, updated = true)
         }
 
         val existing = Users
-            .slice(Users.first_seen, Users.last_seen)
-            .select { Users.user_id eq userId }
+            .select { Users.userId eq userId }
             .limit(1)
             .firstOrNull()
             ?: return@transaction SeenRecordResult(inserted = false, updated = false)
 
-        val currentFirst = existing[Users.first_seen]
-        val desiredFirst = when {
-            currentFirst <= 0L -> now
-            now < currentFirst -> now
-            else -> currentFirst
-        }
-        val needsFirstUpdate = desiredFirst != currentFirst
-        val currentLast = existing[Users.last_seen]
-        val needsLastUpdate = currentLast <= 0L || currentLast < now
-        if (!needsFirstUpdate && !needsLastUpdate) {
+        val currentLastSeen = existing[Users.lastSeenAt]
+        val shouldUpdateLastSeen = now > currentLastSeen
+        val currentLanguage = existing[Users.languageCode]
+        val shouldUpdateLanguage = sanitizedLanguage != null && sanitizedLanguage != currentLanguage
+
+        if (!shouldUpdateLastSeen && !shouldUpdateLanguage) {
             return@transaction SeenRecordResult(inserted = false, updated = false)
         }
 
-        Users.update({ Users.user_id eq userId }) { row ->
-            if (needsFirstUpdate) {
-                row[Users.first_seen] = desiredFirst
+        Users.update({ Users.userId eq userId }) { row ->
+            if (shouldUpdateLastSeen) {
+                row[Users.lastSeenAt] = now
             }
-            row[Users.last_seen] = now
+            if (shouldUpdateLanguage) {
+                row[Users.languageCode] = sanitizedLanguage
+            }
         }
 
         SeenRecordResult(inserted = false, updated = true)
     }
-
-    fun touch(userId: Long, now: Long = System.currentTimeMillis()): Boolean =
-        recordSeen(userId, now).inserted
-
-    fun getAllUserIds(includeBlocked: Boolean = false): List<Long> = transaction {
-        val query = if (includeBlocked) {
-            Users.slice(Users.user_id).selectAll()
-        } else {
-            Users.slice(Users.user_id).select { activeUsersCondition() }
-        }
-        query.map { it[Users.user_id] }
-    }
-
-    fun countUsers(includeBlocked: Boolean = true): Long = transaction {
-        val query = if (includeBlocked) {
-            Users.selectAll()
-        } else {
-            Users.select { activeUsersCondition() }
-        }
-        query.count().toLong()
-    }
-
-    fun countBlocked(): Long = transaction {
-        Users
-            .select { blockedUsersCondition() }
-            .count()
-            .toLong()
-    }
-
-    fun countActiveSince(fromMs: Long): Long = transaction {
-        val threshold = fromMs.coerceAtLeast(0L)
-        Users
-            .select { activeUsersCondition() and (Users.last_seen greaterEq threshold) }
-            .count()
-            .toLong()
-    }
-
-    fun countActiveInstalls(fromMs: Long): Long = transaction {
-        Users
-            .select { activeUsersCondition() }
-            .count()
-            .toLong()
-    }
-
-    fun summarizeForStats(activeSince: Long): StatsSummary = transaction {
-        val threshold = activeSince.coerceAtLeast(0L)
-        data class Accumulator(var lastSeen: Long = 0L, var blockedTs: Long = 0L, var blockedFlag: Boolean = false)
-
-        val users = linkedMapOf<Long, Accumulator>()
-        var sourcesUsed = 0
-
-        fun ensureUser(id: Long): Accumulator = users.getOrPut(id) { Accumulator() }
-
-        if (tableExists("users") && columnExists("users", "user_id")) {
-            sourcesUsed += 1
-            Users
-                .slice(Users.user_id, Users.last_seen, Users.blocked_ts, Users.blocked)
-                .selectAll()
-                .forEach { row ->
-                    val id = row[Users.user_id]
-                    val acc = ensureUser(id)
-                    val lastSeen = row[Users.last_seen]
-                    if (lastSeen > acc.lastSeen) acc.lastSeen = lastSeen
-                    val blockedTs = row[Users.blocked_ts]
-                    if (blockedTs > acc.blockedTs) acc.blockedTs = blockedTs
-                    if (row[Users.blocked]) acc.blockedFlag = true
-                }
-        }
-
-        fun mergeTimestampSource(table: String, tsColumn: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, tsColumn)) return
-            sourcesUsed += 1
-            val sql = """
-                SELECT user_id, MAX(COALESCE($tsColumn, 0)) AS last_seen
-                FROM $table
-                WHERE user_id IS NOT NULL
-                  AND TRIM(CAST(user_id AS TEXT)) != ''
-                GROUP BY user_id
-            """.trimIndent()
-            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    val last = parseEpoch(rs.getObject("last_seen")) ?: 0L
-                    val acc = ensureUser(id)
-                    if (last > acc.lastSeen) acc.lastSeen = last
-                }
-            }
-        }
-
-        fun mergePlainSource(table: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id")) return
-            sourcesUsed += 1
-            val sql = """
-                SELECT user_id
-                FROM $table
-                WHERE user_id IS NOT NULL
-                  AND TRIM(CAST(user_id AS TEXT)) != ''
-            """.trimIndent()
-            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    ensureUser(id)
-                }
-            }
-        }
-
-        fun mergeStatsDay(table: String, dayColumn: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, dayColumn)) return
-            sourcesUsed += 1
-            val sql = """
-                SELECT user_id, $dayColumn AS day
-                FROM $table
-                WHERE user_id IS NOT NULL
-                  AND TRIM(CAST(user_id AS TEXT)) != ''
-                  AND $dayColumn IS NOT NULL
-            """.trimIndent()
-            exec(sql, explicitStatementType = StatementType.SELECT) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    val day = parseStatsDay(rs.getString("day")) ?: continue
-                    val acc = ensureUser(id)
-                    if (day > acc.lastSeen) acc.lastSeen = day
-                }
-            }
-        }
-
-        mergeTimestampSource("messages", "ts")
-        mergeTimestampSource("chat_history", "ts")
-        mergeTimestampSource("memory_notes_v2", "ts")
-        mergeTimestampSource("premium_reminders", "sent_ts")
-        mergeTimestampSource("payments", "created_at")
-        mergePlainSource("usage_counters")
-        mergePlainSource("premium_users")
-        mergeStatsDay("user_stats", "day")
-
-        val total = users.size.toLong()
-        if (total == 0L) {
-            return@transaction StatsSummary(
-                totalUsers = 0,
-                blockedUsers = 0,
-                activeInstalls = 0,
-                sourcesUsed = sourcesUsed,
-                activeWindowPopulation = 0,
-            )
-        }
-
-        var blocked = 0L
-        var activeInstalls = 0L
-        var activeWindow = 0L
-        users.values.forEach { acc ->
-            val isBlocked = acc.blockedFlag || acc.blockedTs > 0L
-            if (isBlocked) {
-                blocked += 1
-            } else {
-                activeInstalls += 1
-                if (acc.lastSeen >= threshold) {
-                    activeWindow += 1
-                }
-            }
-        }
-
-        StatsSummary(
-            totalUsers = total,
-            blockedUsers = blocked,
-            activeInstalls = activeInstalls,
-            sourcesUsed = sourcesUsed,
-            activeWindowPopulation = activeWindow,
-        )
-    }
-
-    fun loadActiveBatch(afterUserId: Long? = null, limit: Int, activeSince: Long? = null): List<Long> = transaction {
-        if (limit <= 0) return@transaction emptyList()
-        Users
-            .slice(Users.user_id)
-            .select {
-                var condition: Op<Boolean> = activeUsersCondition()
-                if (afterUserId != null && afterUserId > 0) {
-                    condition = (Users.user_id greater afterUserId) and condition
-                }
-                val activeThreshold = activeSince?.takeIf { it > 0L }
-                if (activeThreshold != null) {
-                    condition = condition and (Users.last_seen greaterEq activeThreshold)
-                }
-                condition
-            }
-            .orderBy(Users.user_id to SortOrder.ASC)
-            .limit(limit)
-            .map { it[Users.user_id] }
-    }
-
-    fun exists(userId: Long): Boolean = transaction {
-        Users
-            .slice(Users.user_id)
-            .select { Users.user_id eq userId }
-            .limit(1)
-            .any()
-    }
-
-    fun find(userId: Long): UserInfo? = transaction {
-        Users
-            .select { Users.user_id eq userId }
-            .limit(1)
-            .firstOrNull()
-            ?.let {
-                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
-                UserInfo(
-                    userId = it[Users.user_id],
-                    firstSeen = it[Users.first_seen],
-                    lastSeen = it[Users.last_seen],
-                    blockedTs = normalizedBlockedTs,
-                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
-                )
-            }
-    }
-
-    fun loadSnapshot(userId: Long): UserSnapshot? = transaction {
-        Users
-            .select { Users.user_id eq userId }
-            .limit(1)
-            .firstOrNull()
-            ?.let {
-                val normalizedBlockedTs = normalizeBlockedTimestamp(it[Users.blocked_ts])
-                return@transaction UserSnapshot(
-                    userId = it[Users.user_id],
-                    firstSeen = it[Users.first_seen].takeIf { ts -> ts > 0L },
-                    lastSeen = it[Users.last_seen].takeIf { ts -> ts > 0L },
-                    blockedTs = normalizedBlockedTs,
-                    existsInUsers = true,
-                    blocked = isRowBlocked(it[Users.blocked], normalizedBlockedTs)
-                )
-            }
-
-        val (hasPresence, resolvedTs) = resolveFirstSeenCandidate(userId)
-        if (!hasPresence) {
-            return@transaction null
-        }
-
-        UserSnapshot(
-            userId = userId,
-            firstSeen = resolvedTs?.takeIf { it > 0L },
-            lastSeen = null,
-            blockedTs = 0L,
-            existsInUsers = false,
-            blocked = false,
-        )
-    }
-
-    data class MarkBlockedResult(
-        val changed: Boolean,
-        val previousBlocked: Boolean,
-        val currentBlocked: Boolean,
-    )
 
     fun markBlocked(
         userId: Long,
         blocked: Boolean,
         now: Long = System.currentTimeMillis()
     ): MarkBlockedResult = transaction {
-        val value = if (blocked) now else 0L
+        if (userId <= 0L) return@transaction MarkBlockedResult(false, false, blocked)
+        val blockedValue: Long? = if (blocked) now else null
 
-        val inserted = Users.insertIgnore {
-            it[Users.user_id] = userId
-            it[Users.first_seen] = now
-            it[Users.last_seen] = now
-            it[Users.blocked_ts] = value
-            it[Users.blocked] = blocked
+        val inserted = Users.insertIgnore { row ->
+            row[Users.userId] = userId
+            row[Users.firstSeenAt] = now
+            row[Users.lastSeenAt] = now
+            row[Users.isBlocked] = blocked
+            row[Users.blockedAt] = blockedValue
+            row[Users.languageCode] = null
         }
         if (inserted.insertedCount > 0) {
             return@transaction MarkBlockedResult(
@@ -371,378 +105,92 @@ object UsersRepo {
             )
         }
 
-        val existing = Users
-            .slice(Users.blocked, Users.blocked_ts)
-            .select { Users.user_id eq userId }
+        val row = Users
+            .select { Users.userId eq userId }
             .limit(1)
             .firstOrNull()
-            ?: return@transaction MarkBlockedResult(
-                changed = false,
-                previousBlocked = false,
-                currentBlocked = blocked,
-            )
+            ?: return@transaction MarkBlockedResult(false, false, blocked)
 
-        val normalizedBlockedTs = normalizeBlockedTimestamp(existing[Users.blocked_ts])
-        val currentBlocked = isRowBlocked(existing[Users.blocked], normalizedBlockedTs)
-        val shouldUpdate = when {
-            blocked -> !currentBlocked || normalizedBlockedTs != value
-            else -> currentBlocked || normalizedBlockedTs != 0L
-        }
+        val previousBlocked = row[Users.isBlocked]
+        val previousBlockedAt = row[Users.blockedAt]
+        val shouldUpdate = previousBlocked != blocked || previousBlockedAt != blockedValue
 
-        if (!shouldUpdate) {
-            return@transaction MarkBlockedResult(
-                changed = false,
-                previousBlocked = currentBlocked,
-                currentBlocked = currentBlocked,
-            )
-        }
-
-        Users.update({ Users.user_id eq userId }) { row ->
-            row[Users.blocked_ts] = value
-            row[Users.blocked] = blocked
+        if (shouldUpdate) {
+            Users.update({ Users.userId eq userId }) { update ->
+                update[Users.isBlocked] = blocked
+                update[Users.blockedAt] = blockedValue
+            }
         }
 
         MarkBlockedResult(
-            changed = true,
-            previousBlocked = currentBlocked,
+            changed = shouldUpdate,
+            previousBlocked = previousBlocked,
             currentBlocked = blocked,
         )
     }
 
-    fun repairOrphans(source: String? = null, now: Long = System.currentTimeMillis()): Long {
-        val inserted = transaction {
-            if (!tableExists("users")) return@transaction 0L
-
-            val candidates = collectBackfillCandidates()
-            var insertedCount = 0L
-            for ((userId, firstSeenCandidate) in candidates) {
-                val result = ensureUserInternal(userId, firstSeenCandidate, now)
-                if (result.success && result.inserted) {
-                    insertedCount += 1
-                }
-            }
-            insertedCount
-        }
-
-        if (source != null && inserted > 0) {
-            println("USERS: backfilled $inserted existing users source=$source")
-        }
-
-        return inserted
-    }
-
-    fun repairUser(userId: Long, source: String? = null, now: Long = System.currentTimeMillis()): Boolean {
-        val result = transaction {
-            if (!tableExists("users")) return@transaction EnsureResult(success = false, inserted = false)
-            val (hasAnyData, resolvedTs) = resolveFirstSeenCandidate(userId)
-            if (!hasAnyData) return@transaction EnsureResult(success = false, inserted = false)
-            ensureUserInternal(userId, resolvedTs, now)
-        }
-
-        if (result.success && result.inserted && source != null) {
-            println("USERS: repaired user_id=$userId source=$source")
-        }
-
-        return result.success
-    }
-
-    private data class EnsureResult(val success: Boolean, val inserted: Boolean)
-
-    private fun Transaction.collectBackfillCandidates(): Map<Long, Long?> {
-        val result = mutableMapOf<Long, Long?>()
-
-        fun record(userId: Long, candidateTs: Long?) {
-            if (userId <= 0) return
-            if (candidateTs != null && candidateTs > 0L) {
-                val current = result[userId]
-                result[userId] = when {
-                    current == null -> candidateTs
-                    current <= 0L -> candidateTs
-                    else -> min(current, candidateTs)
-                }
-            } else {
-                result.putIfAbsent(userId, null)
-            }
-        }
-
-        fun scanWithTimestamp(table: String, tsColumn: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, tsColumn)) return
-            exec(
-                """
-                    SELECT CAST(user_id AS TEXT) AS user_id,
-                           MIN($tsColumn)           AS first_ts,
-                           COUNT(1)                 AS total
-                    FROM $table
-                    WHERE user_id IS NOT NULL AND TRIM(CAST(user_id AS TEXT)) != ''
-                    GROUP BY user_id
-                """.trimIndent()
-            ) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    val total = rs.getLong("total")
-                    if (total <= 0L) continue
-                    val ts = parseEpoch(rs.getObject("first_ts"))
-                    if (ts != null && ts > 0L) {
-                        record(id, ts)
-                    } else {
-                        record(id, null)
-                    }
-                }
-            }
-        }
-
-        fun scanUserStats() {
-            if (!tableExists("user_stats") || !columnExists("user_stats", "user_id") || !columnExists("user_stats", "day")) {
-                return
-            }
-            exec(
-                """
-                    SELECT CAST(user_id AS TEXT) AS user_id,
-                           MIN(day)               AS first_day
-                    FROM user_stats
-                    WHERE user_id IS NOT NULL AND TRIM(CAST(user_id AS TEXT)) != ''
-                      AND day IS NOT NULL AND TRIM(day) != ''
-                    GROUP BY user_id
-                """.trimIndent()
-            ) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    val ts = parseStatsDay(rs.getString("first_day"))
-                    if (ts != null && ts > 0L) {
-                        record(id, ts)
-                    } else {
-                        record(id, null)
-                    }
-                }
-            }
-        }
-
-        fun scanPresence(table: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id")) return
-            exec(
-                """
-                    SELECT DISTINCT CAST(user_id AS TEXT) AS user_id
-                    FROM $table
-                    WHERE user_id IS NOT NULL AND TRIM(CAST(user_id AS TEXT)) != ''
-                """.trimIndent()
-            ) { rs ->
-                while (rs?.next() == true) {
-                    val id = parseUserId(rs) ?: continue
-                    record(id, null)
-                }
-            }
-        }
-
-        scanWithTimestamp("messages", "ts")
-        scanWithTimestamp("chat_history", "ts")
-        scanWithTimestamp("memory_notes_v2", "ts")
-        scanWithTimestamp("premium_reminders", "sent_ts")
-        scanWithTimestamp("payments", "created_at")
-        scanUserStats()
-        scanPresence("usage_counters")
-        scanPresence("premium_users")
-
-        return result
-    }
-
-    private fun Transaction.ensureUserInternal(userId: Long, resolvedTs: Long?, now: Long): EnsureResult {
-        if (userId <= 0) return EnsureResult(success = false, inserted = false)
-        val firstSeenValue = resolvedTs?.takeIf { it > 0L } ?: now
-        val insert = Users.insertIgnore {
-            it[Users.user_id] = userId
-            it[Users.first_seen] = firstSeenValue
-            it[Users.last_seen] = firstSeenValue
-            it[Users.blocked_ts] = 0L
-            it[Users.blocked] = false
-        }
-        if (insert.insertedCount > 0) {
-            return EnsureResult(success = true, inserted = true)
-        }
-
-        val row = Users
-            .select { Users.user_id eq userId }
+    fun loadSnapshot(userId: Long): UserSnapshot? = transaction {
+        Users
+            .select { Users.userId eq userId }
             .limit(1)
             .firstOrNull()
-            ?: return EnsureResult(success = false, inserted = false)
-
-        val existingFirst = row[Users.first_seen]
-        val existingLast = row[Users.last_seen]
-        val desiredFirst = when {
-            resolvedTs != null && resolvedTs > 0L && existingFirst > 0L -> min(existingFirst, resolvedTs)
-            resolvedTs != null && resolvedTs > 0L -> resolvedTs
-            existingFirst > 0L -> existingFirst
-            else -> now
-        }
-        val needsFirstUpdate = desiredFirst != existingFirst
-        val needsLastUpdate = existingLast <= 0L
-        if (needsFirstUpdate || needsLastUpdate) {
-            Users.update({ Users.user_id eq userId }) { update ->
-                if (needsFirstUpdate) {
-                    update[Users.first_seen] = desiredFirst
-                }
-                if (needsLastUpdate) {
-                    update[Users.last_seen] = desiredFirst
-                }
+            ?.let { row ->
+                val firstSeen = row[Users.firstSeenAt].takeIf { it > 0L }
+                val lastSeen = row[Users.lastSeenAt].takeIf { it > 0L }
+                val blockedTs = row[Users.blockedAt] ?: 0L
+                UserSnapshot(
+                    userId = row[Users.userId],
+                    firstSeen = firstSeen,
+                    lastSeen = lastSeen,
+                    blockedTs = blockedTs,
+                    existsInUsers = true,
+                    blocked = row[Users.isBlocked],
+                    languageCode = row[Users.languageCode]
+                )
             }
-        }
-        return EnsureResult(success = true, inserted = false)
     }
 
-    private fun Transaction.resolveFirstSeenCandidate(userId: Long): Pair<Boolean, Long?> {
-        if (userId <= 0) return false to null
-        var earliest: Long? = null
-        var hasPresence = false
-
-        fun recordTimestamp(ts: Long?) {
-            hasPresence = true
-            if (ts != null && ts > 0L) {
-                earliest = earliest?.let { min(it, ts) } ?: ts
-            }
-        }
-
-        fun recordPresence() {
-            hasPresence = true
-        }
-
-        fun scanWithTimestamp(table: String, tsColumn: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id") || !columnExists(table, tsColumn)) return
-            val whereClause = matchUserClause("user_id", userId)
-            exec(
-                """
-                    SELECT COUNT(1) AS total, MIN($tsColumn) AS first_ts
-                    FROM $table
-                    WHERE $whereClause
-                """.trimIndent()
-            ) { rs ->
-                if (rs?.next() == true) {
-                    val total = rs.getLong("total")
-                    if (total > 0L) {
-                        recordTimestamp(parseEpoch(rs.getObject("first_ts")))
-                    }
-                }
-            }
-        }
-
-        fun scanUserStats() {
-            if (!tableExists("user_stats") || !columnExists("user_stats", "user_id") || !columnExists("user_stats", "day")) {
-                return
-            }
-            val whereClause = matchUserClause("user_id", userId)
-            exec(
-                """
-                    SELECT day
-                    FROM user_stats
-                    WHERE $whereClause AND day IS NOT NULL AND TRIM(day) != ''
-                """.trimIndent()
-            ) { rs ->
-                var sawAny = false
-                while (rs?.next() == true) {
-                    sawAny = true
-                    val ts = parseStatsDay(rs.getString("day"))
-                    if (ts != null && ts > 0L) {
-                        earliest = earliest?.let { min(it, ts) } ?: ts
-                    }
-                }
-                if (sawAny) {
-                    recordPresence()
-                }
-            }
-        }
-
-        fun scanPresence(table: String) {
-            if (!tableExists(table) || !columnExists(table, "user_id")) return
-            val whereClause = matchUserClause("user_id", userId)
-            exec(
-                """
-                    SELECT 1
-                    FROM $table
-                    WHERE $whereClause
-                    LIMIT 1
-                """.trimIndent()
-            ) { rs ->
-                if (rs?.next() == true) {
-                    recordPresence()
-                }
-            }
-        }
-
-        scanWithTimestamp("messages", "ts")
-        scanWithTimestamp("chat_history", "ts")
-        scanWithTimestamp("memory_notes_v2", "ts")
-        scanWithTimestamp("premium_reminders", "sent_ts")
-        scanWithTimestamp("payments", "created_at")
-        scanUserStats()
-        scanPresence("usage_counters")
-        scanPresence("premium_users")
-
-        return hasPresence to earliest
+    fun countTotal(): Long = transaction {
+        Users.selectAll().count().toLong()
     }
 
-    private fun SqlExpressionBuilder.blockedUsersCondition(): Op<Boolean> =
-        (Users.blocked eq true) or (Users.blocked_ts greater 0L)
-
-    private fun SqlExpressionBuilder.activeUsersCondition(): Op<Boolean> =
-        (Users.blocked eq false) and (Users.blocked_ts lessEq 0L)
-
-    private fun isRowBlocked(blockedFlag: Boolean, blockedTs: Long): Boolean =
-        blockedFlag || blockedTs > 0L
-
-    private fun normalizeBlockedTimestamp(raw: Long): Long {
-        if (raw <= 0L) return 0L
-        return if (raw in 1_000_000_000L..4_000_000_000L) raw * 1000L else raw
+    fun countBlocked(): Long = transaction {
+        Users.select { Users.isBlocked eq true }.count().toLong()
     }
 
-    private fun parseUserId(rs: ResultSet, column: String = "user_id"): Long? {
-        val raw = rs.getObject(column) ?: return null
-        val parsed = when (raw) {
-            is Number -> raw.toLong()
-            is String -> raw.trim().toLongOrNull()
-            else -> raw.toString().trim().toLongOrNull()
+    fun countActive(): Long = transaction {
+        Users.select { Users.isBlocked eq false }.count().toLong()
+    }
+
+    fun countActiveSince(fromMs: Long): Long = transaction {
+        val threshold = fromMs.coerceAtLeast(0L)
+        Users
+            .select { (Users.isBlocked eq false) and (Users.lastSeenAt greaterEq threshold) }
+            .count()
+            .toLong()
+    }
+
+    fun loadActiveBatch(
+        afterUserId: Long? = null,
+        limit: Int,
+        activeSince: Long? = null
+    ): List<Long> = transaction {
+        if (limit <= 0) return@transaction emptyList()
+        var condition = Users.isBlocked eq false
+        if (afterUserId != null && afterUserId > 0) {
+            condition = condition and (Users.userId greater afterUserId)
         }
-        return parsed?.takeIf { it > 0L }
-    }
-
-    private fun parseEpoch(value: Any?): Long? = when (value) {
-        null -> null
-        is Number -> value.toLong()
-        is String -> value.trim().toLongOrNull()
-        else -> value.toString().trim().toLongOrNull()
-    }
-
-    private fun parseStatsDay(dayRaw: String?): Long? {
-        if (dayRaw.isNullOrBlank()) return null
-        return runCatching {
-            val date = LocalDate.parse(dayRaw.trim(), DateTimeFormatter.ISO_DATE)
-            date.atStartOfDay().toInstant(ZoneOffset.UTC).toEpochMilli()
-        }.getOrNull()
-    }
-
-    private fun matchUserClause(column: String, userId: Long): String =
-        "( ($column = $userId) OR (TRIM(CAST($column AS TEXT)) = '$userId') )"
-
-    private fun ResultSet.getLongOrZero(column: String): Long {
-        val value = getLong(column)
-        return if (wasNull()) 0L else value
-    }
-
-    private fun Transaction.tableExists(name: String): Boolean {
-        val normalized = name.trim().ifBlank { return false }
-        return try {
-            exec("SELECT 1 FROM $normalized LIMIT 1", explicitStatementType = StatementType.SELECT) { true }
-            true
-        } catch (_: Exception) {
-            false
+        val threshold = activeSince?.takeIf { it > 0L }
+        if (threshold != null) {
+            condition = condition and (Users.lastSeenAt greaterEq threshold)
         }
+        Users
+            .slice(Users.userId)
+            .select { condition }
+            .orderBy(Users.userId to SortOrder.ASC)
+            .limit(limit)
+            .map { it[Users.userId] }
     }
 
-    private fun Transaction.columnExists(table: String, column: String): Boolean {
-        val tableName = table.trim().ifBlank { return false }
-        val columnName = column.trim().ifBlank { return false }
-        return try {
-            exec("SELECT $columnName FROM $tableName LIMIT 1", explicitStatementType = StatementType.SELECT) { true }
-            true
-        } catch (_: Exception) {
-            false
-        }
-    }
+    fun repairOrphans(source: String? = null, now: Long = System.currentTimeMillis()): Long = 0L
 }
