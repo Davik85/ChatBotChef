@@ -2,6 +2,8 @@ package app.telegram
 
 import app.AppConfig
 import app.db.AdminAuditRepo
+import app.db.BroadcastRepo
+import app.db.BroadcastRepo.RecipientStatus
 import app.db.ChatHistoryRepo
 import app.db.MessagesRepo
 import app.db.PremiumRepo
@@ -1548,17 +1550,36 @@ class TelegramLongPolling(
                         api.sendMessage(adminChatId, "Активных пользователей не найдено — рассылать некому.", parseMode = null)
                         return@launch
                     }
+                    val broadcastId = runCatching {
+                        val mediaType = when (broadcastType) {
+                            BroadcastContentType.TEXT -> null
+                            BroadcastContentType.PHOTO -> "photo"
+                            BroadcastContentType.VIDEO -> "video"
+                        }
+                        BroadcastRepo.createBroadcast(
+                            createdBy = adminId,
+                            text = draft.text,
+                            mediaType = mediaType,
+                            mediaFileId = draft.mediaFileId
+                        )
+                    }
+                        .onFailure {
+                            println("ADMIN-BROADCAST-ERR: failed to create broadcast ${it.message}")
+                            api.sendMessage(adminChatId, "Не удалось зафиксировать рассылку в базе.", parseMode = null)
+                        }
+                        .getOrNull()
+                        ?: return@launch
                     val blockedSkipped = audience.blockedUsers.coerceAtLeast(0L)
                     println(
                         "BCAST-START total=$totalRecipients type=${broadcastType.name} " +
                             "blocked_skipped=$blockedSkipped known_users=${audience.totalUsers} " +
-                            "threshold=${audience.activeThreshold}"
+                            "threshold=${audience.activeThreshold} broadcast_id=$broadcastId"
                     )
                     AdminAuditRepo.record(
                         adminId = adminId,
                         action = "broadcast_start",
                         target = adminChatId.toString(),
-                        meta = "recipients=$totalRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name}"
+                        meta = "recipients=$totalRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name} broadcast_id=$broadcastId"
                     )
                     var sentRecipients = 0L
                     var failedRecipients = 0L
@@ -1588,6 +1609,10 @@ class TelegramLongPolling(
                             )
                             break
                         }
+                        runCatching { BroadcastRepo.registerRecipients(broadcastId, batch) }
+                            .onFailure {
+                                println("BCAST-DB-ERR: id=$broadcastId action=register size=${batch.size} reason=${it.message}")
+                            }
                         println(
                             "BCAST-BATCH size=${batch.size} first=${batch.first()} last=${batch.last()} " +
                                 "threshold=${audience.activeThreshold}"
@@ -1600,18 +1625,51 @@ class TelegramLongPolling(
                                     sentRecipients++
                                     UserService.markInteraction(recipient, "broadcast")
                                     println("BCAST-SEND ok user=$recipient")
+                                    runCatching {
+                                        BroadcastRepo.markRecipientStatus(
+                                            broadcastId,
+                                            recipient,
+                                            RecipientStatus.SENT,
+                                            null,
+                                            null
+                                        )
+                                    }.onFailure {
+                                        println("BCAST-DB-ERR: id=$broadcastId user=$recipient status=sent reason=${it.message}")
+                                    }
                                 }
                                 BroadcastResult.BLOCKED -> {
                                     blockedRecipients++
                                     val code = outcome.errorCode?.toString() ?: "403"
                                     val desc = sanitizeLogValue(outcome.description) ?: "blocked"
                                     println("BCAST-ERR user=$recipient code=$code reason=$desc")
+                                    runCatching {
+                                        BroadcastRepo.markRecipientStatus(
+                                            broadcastId,
+                                            recipient,
+                                            RecipientStatus.FAILED,
+                                            outcome.errorCode ?: 403,
+                                            outcome.description
+                                        )
+                                    }.onFailure {
+                                        println("BCAST-DB-ERR: id=$broadcastId user=$recipient status=blocked reason=${it.message}")
+                                    }
                                 }
                                 BroadcastResult.FAILED -> {
                                     failedRecipients++
                                     val code = outcome.errorCode?.toString() ?: "unknown"
                                     val desc = sanitizeLogValue(outcome.description) ?: "unknown"
                                     println("BCAST-ERR user=$recipient code=$code reason=$desc")
+                                    runCatching {
+                                        BroadcastRepo.markRecipientStatus(
+                                            broadcastId,
+                                            recipient,
+                                            RecipientStatus.FAILED,
+                                            outcome.errorCode,
+                                            outcome.description
+                                        )
+                                    }.onFailure {
+                                        println("BCAST-DB-ERR: id=$broadcastId user=$recipient status=failed reason=${it.message}")
+                                    }
                                 }
                             }
                             val delayMs = Random.nextLong(
@@ -1635,11 +1693,11 @@ class TelegramLongPolling(
                         adminId = adminId,
                         action = "broadcast_done",
                         target = adminChatId.toString(),
-                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name}"
+                        meta = "sent=$sentRecipients failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped type=${broadcastType.name} broadcast_id=$broadcastId"
                     )
                     println(
                         "BCAST-DONE type=${broadcastType.name} total=$totalRecipients ok=$sentRecipients " +
-                            "err=$errors failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped"
+                            "err=$errors failed=$failedRecipients blocked=$blockedRecipients blocked_skipped=$blockedSkipped broadcast_id=$broadcastId"
                     )
                 } finally {
                     synchronized(broadcastMutex) { broadcastJob = null }

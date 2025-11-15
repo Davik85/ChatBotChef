@@ -1,5 +1,6 @@
 package app.logic.user
 
+import app.db.UsageCountersRepo
 import app.db.UsersRepo
 import app.telegram.dto.TgUser
 
@@ -11,24 +12,45 @@ object UserService {
         ?.takeIf { it.isNotEmpty() }
         ?.take(200)
 
+    private fun sanitizeLanguage(raw: String?): String? = raw
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.take(16)
+
+    fun touchUserOnUpdate(
+        userId: Long,
+        languageCode: String?,
+        now: Long = System.currentTimeMillis()
+    ): UsersRepo.SeenRecordResult? {
+        if (userId <= 0L) return null
+        val sanitizedLanguage = sanitizeLanguage(languageCode)
+        val seenResult = runCatching { UsersRepo.recordSeen(userId, now, sanitizedLanguage) }
+            .onFailure {
+                println("DB-USERS-UPSERT-ERR: id=$userId source=update reason=${it.message}")
+            }
+            .getOrNull()
+        runCatching { UsageCountersRepo.ensureRow(userId, now) }
+            .onFailure { println("USAGE-ENSURE-ERR: user_id=$userId reason=${it.message}") }
+        return seenResult
+    }
+
     fun ensureUser(from: TgUser?, source: String, now: Long = System.currentTimeMillis()) {
         val user = from ?: return
         val userId = user.id
         if (userId <= 0L) return
-        runCatching { UsersRepo.recordSeen(userId, now) }
-            .onSuccess { result ->
-                val insertedFlag = if (result.inserted) 1 else 0
-                println("DB-USERS-UPSERT: id=$userId source=$source inserted=$insertedFlag")
-            }
-            .onFailure {
-                println("DB-USERS-UPSERT-ERR: id=$userId source=$source reason=${it.message}")
-            }
+        val result = touchUserOnUpdate(userId, user.language_code, now)
+        if (result != null) {
+            val insertedFlag = if (result.inserted) 1 else 0
+            println("DB-USERS-UPSERT: id=$userId source=$source inserted=$insertedFlag")
+        }
     }
 
     fun markInteraction(userId: Long, source: String, now: Long = System.currentTimeMillis()) {
         if (userId <= 0L) return
         runCatching { UsersRepo.recordSeen(userId, now) }
             .onFailure { println("USER-SEEN-ERR: user_id=$userId source=$source reason=${it.message}") }
+        runCatching { UsageCountersRepo.ensureRow(userId, now) }
+            .onFailure { println("USAGE-ENSURE-ERR: user_id=$userId source=$source reason=${it.message}") }
         runCatching { UsersRepo.markBlocked(userId, blocked = false, now = now) }
             .onSuccess { result ->
                 if (result.changed && result.previousBlocked && !result.currentBlocked) {

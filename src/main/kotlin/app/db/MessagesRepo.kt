@@ -10,11 +10,16 @@ import org.jetbrains.exposed.sql.select
 import org.jetbrains.exposed.sql.transactions.transaction
 
 object MessagesRepo {
-    private const val MAX_STORED_TEXT = 4000
 
-    private fun normalizeRole(role: String): String = when (role.lowercase()) {
-        "user", "assistant", "system" -> role.lowercase()
-        else -> "user"
+    private fun resolveDirection(role: String): String = when (role.lowercase()) {
+        "user" -> "in"
+        else -> "out"
+    }
+
+    private fun resolveKind(role: String): String = when (role.lowercase()) {
+        "user", "assistant" -> "text"
+        "system" -> "other"
+        else -> "other"
     }
 
     fun record(
@@ -23,19 +28,14 @@ object MessagesRepo {
         role: String = "user",
         ts: Long = System.currentTimeMillis()
     ) = transaction {
-        val normalized = if (text.length > MAX_STORED_TEXT) {
-            text.substring(0, MAX_STORED_TEXT)
-        } else {
-            text
-        }
-        val trimmed = normalized.trim()
-        if (trimmed.isEmpty()) return@transaction
-        val safeRole = normalizeRole(role)
+        if (userId <= 0L) return@transaction
+        val direction = resolveDirection(role)
+        val kind = resolveKind(role)
         Messages.insert {
-            it[Messages.user_id] = userId
-            it[Messages.ts] = ts
-            it[Messages.text] = trimmed
-            it[Messages.role] = safeRole
+            it[Messages.userId] = userId
+            it[Messages.timestamp] = ts
+            it[Messages.direction] = direction
+            it[Messages.kind] = kind
         }
     }
 
@@ -44,8 +44,8 @@ object MessagesRepo {
             return UsersRepo.countActiveSince(fromMs)
         }
         return transaction {
-            val countExpr = Messages.user_id.countDistinct()
-            val baseCondition = (Messages.ts greater fromMs) and (Messages.role eq "user")
+            val countExpr = Messages.userId.countDistinct()
+            val baseCondition = (Messages.timestamp greater fromMs) and (Messages.direction eq "in")
             Messages
                 .slice(countExpr)
                 .select { baseCondition }
@@ -59,9 +59,9 @@ object MessagesRepo {
     fun countUserMessagesSince(userId: Long, fromMs: Long): Long = transaction {
         Messages
             .select {
-                (Messages.user_id eq userId) and
-                    (Messages.ts.greaterEq(fromMs)) and
-                    (Messages.role eq "user")
+                (Messages.userId eq userId) and
+                    (Messages.timestamp greaterEq fromMs) and
+                    (Messages.direction eq "in")
             }
             .count()
             .toLong()
@@ -69,7 +69,7 @@ object MessagesRepo {
 
     fun countTotalUserMessages(userId: Long): Long = transaction {
         Messages
-            .select { (Messages.user_id eq userId) and (Messages.role eq "user") }
+            .select { (Messages.userId eq userId) and (Messages.direction eq "in") }
             .count()
             .toLong()
     }

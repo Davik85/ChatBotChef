@@ -19,7 +19,7 @@ object ProcessedUpdatesRepo {
         val inserted = runCatching {
             transaction {
                 ProcessedUpdates.insertIgnore {
-                    it[ProcessedUpdates.update_id] = updateId
+                    it[ProcessedUpdates.updateId] = updateId
                 } != null
             }
         }.onFailure {
@@ -38,7 +38,7 @@ object ProcessedUpdatesRepo {
         if (updateId <= 0L) return
         runCatching {
             transaction {
-                ProcessedUpdates.deleteWhere { ProcessedUpdates.update_id eq updateId }
+                ProcessedUpdates.deleteWhere { ProcessedUpdates.updateId eq updateId }
             }
         }.onFailure {
             println("TG-POLL-ERR: failed_to_remove_update update=$updateId reason=${it.message}")
@@ -48,7 +48,7 @@ object ProcessedUpdatesRepo {
     fun lastProcessedId(): Long {
         return runCatching {
             transaction {
-                val maxIdAlias = ProcessedUpdates.update_id.max()
+                val maxIdAlias = ProcessedUpdates.updateId.max()
                 ProcessedUpdates
                     .slice(maxIdAlias)
                     .selectAll()
@@ -65,7 +65,7 @@ object ProcessedUpdatesRepo {
         if (threshold <= 0L) return
         runCatching {
             transaction {
-                ProcessedUpdates.deleteWhere { ProcessedUpdates.update_id less threshold }
+                ProcessedUpdates.deleteWhere { ProcessedUpdates.updateId less threshold }
             }
         }.onFailure {
             println("TG-POLL-ERR: prune_failed reason=${it.message}")

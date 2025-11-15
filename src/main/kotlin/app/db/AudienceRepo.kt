@@ -60,7 +60,7 @@ object AudienceRepo {
                     SELECT COUNT(1) AS total
                     FROM ( $baseUnion ) AS audience
                     JOIN users ON users.user_id = audience.user_id
-                    WHERE users.blocked = 1 OR users.blocked_ts > 0
+                    WHERE COALESCE(users.is_blocked, 0) = 1 OR users.blocked_at IS NOT NULL
                 """.trimIndent()
             )
         } else {
@@ -103,7 +103,7 @@ object AudienceRepo {
                     SELECT audience.user_id AS user_id
                     FROM ( $baseQuery ) AS audience
                     LEFT JOIN users ON users.user_id = audience.user_id
-                    WHERE COALESCE(users.blocked, 0) = 0 AND COALESCE(users.blocked_ts, 0) <= 0
+                    WHERE COALESCE(users.is_blocked, 0) = 0 AND users.blocked_at IS NULL
                     ORDER BY audience.user_id ASC
                     LIMIT $safeLimit OFFSET $safeOffset
                 """.trimIndent()
