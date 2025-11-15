@@ -134,15 +134,8 @@ object UsersRepo {
     }
 
     fun countActiveInstalls(fromMs: Long): Long = transaction {
-        val threshold = fromMs.coerceAtLeast(0L)
         Users
-            .select {
-                if (threshold <= 0L) {
-                    activeUsersCondition()
-                } else {
-                    activeUsersCondition() and (Users.last_seen greaterEq threshold)
-                }
-            }
+            .select { activeUsersCondition() }
             .count()
             .toLong()
     }
