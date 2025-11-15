@@ -49,8 +49,7 @@ object UsersRepo {
     data class StatsSummary(
         val totalUsers: Long,
         val blockedUsers: Long,
-        val activeUsers: Long,
-        val sourcesUsed: Int,
+        val activeInstalls: Long,
         val activeWindowPopulation: Long,
     )
 
