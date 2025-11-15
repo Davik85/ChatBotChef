@@ -2,6 +2,7 @@ package app.logic.stats
 
 import app.db.PremiumRepo
 import app.db.UsersRepo
+import kotlin.math.min
 
 object StatsService {
     data class Snapshot(
@@ -23,15 +24,16 @@ object StatsService {
         val userSummary = UsersRepo.summarizeForStats(threshold)
         val total = userSummary.totalUsers
         val blocked = userSummary.blockedUsers.coerceAtMost(total)
-        val activeInstalls = (total - blocked).coerceAtLeast(0L)
+        val derivedActiveInstalls = (total - blocked).coerceAtLeast(0L)
+        val activeInstalls = min(userSummary.activeInstalls, derivedActiveInstalls).coerceAtLeast(0L)
         val premium = PremiumRepo.countActive(now)
         val active7dThreshold = now - 7 * DAY_MS
         val active7d = UsersRepo.countActiveSince(active7dThreshold).coerceAtLeast(0L)
         println(
             "ADMIN-STATS-DBG: users_total=$total users_blocked=$blocked " +
                 "users_active_installs=$activeInstalls window_from=$threshold " +
+                "users_summary_active_installs=${userSummary.activeInstalls} " +
                 "users_active_window=${userSummary.activeWindowPopulation} " +
-                "users_recent_active=${userSummary.activeUsers} " +
                 "sources=${userSummary.sourcesUsed} " +
                 "premium_active=$premium users_active7d=$active7d"
         )

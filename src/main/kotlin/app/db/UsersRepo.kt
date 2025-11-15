@@ -50,6 +50,7 @@ object UsersRepo {
         val totalUsers: Long,
         val blockedUsers: Long,
         val activeInstalls: Long,
+        val sourcesUsed: Int,
         val activeWindowPopulation: Long,
     )
 
@@ -235,31 +236,31 @@ object UsersRepo {
             return@transaction StatsSummary(
                 totalUsers = 0,
                 blockedUsers = 0,
-                activeUsers = 0,
+                activeInstalls = 0,
                 sourcesUsed = sourcesUsed,
                 activeWindowPopulation = 0,
             )
         }
 
         var blocked = 0L
-        var active = 0L
+        var activeInstalls = 0L
         var activeWindow = 0L
         users.values.forEach { acc ->
             val isBlocked = acc.blockedFlag || acc.blockedTs > 0L
             if (isBlocked) {
                 blocked += 1
-            } else if (acc.lastSeen >= threshold) {
-                active += 1
-            }
-            if (acc.lastSeen >= threshold) {
-                activeWindow += 1
+            } else {
+                activeInstalls += 1
+                if (acc.lastSeen >= threshold) {
+                    activeWindow += 1
+                }
             }
         }
 
         StatsSummary(
             totalUsers = total,
             blockedUsers = blocked,
-            activeUsers = active,
+            activeInstalls = activeInstalls,
             sourcesUsed = sourcesUsed,
             activeWindowPopulation = activeWindow,
         )

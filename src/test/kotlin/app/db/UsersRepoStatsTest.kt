@@ -45,9 +45,9 @@ class UsersRepoStatsTest {
 
         assertEquals(4L, summary.totalUsers)
         assertEquals(1L, summary.blockedUsers)
-        assertEquals(1L, summary.activeUsers)
+        assertEquals(3L, summary.activeInstalls)
         assertEquals(2, summary.sourcesUsed)
-        assertEquals(2L, summary.activeWindowPopulation)
+        assertEquals(1L, summary.activeWindowPopulation)
 
         val active7d = UsersRepo.countActiveSince(now - 7 * dayMs)
         assertEquals(1L, active7d)
