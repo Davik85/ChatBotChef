@@ -127,6 +127,36 @@ object AppConfig {
 
     val adminIds: Set<Long> by lazy { readLongSet("ADMIN_IDS") }
 
+    val openAiModelTokenLimits: Map<String, Int> by lazy {
+        parseModelTokenLimits(clean(readRaw("OPENAI_MODEL_TOKEN_LIMITS")))
+    }
+
+    private fun parseModelTokenLimits(raw: String?): Map<String, Int> {
+        if (raw.isNullOrBlank()) return emptyMap()
+        val result = mutableMapOf<String, Int>()
+        raw.split(',').forEach { entry ->
+            val trimmed = entry.trim()
+            if (trimmed.isEmpty()) return@forEach
+            val parts = trimmed.split('=')
+            if (parts.size != 2) {
+                println("APP-CONFIG-WARN: invalid OPENAI_MODEL_TOKEN_LIMITS entry='$trimmed'")
+                return@forEach
+            }
+            val model = parts[0].trim().lowercase(Locale.ROOT)
+            val limit = parts[1].trim().toIntOrNull()
+            if (model.isEmpty() || limit == null) {
+                println("APP-CONFIG-WARN: invalid OPENAI_MODEL_TOKEN_LIMITS entry='$trimmed'")
+                return@forEach
+            }
+            if (limit <= 0) {
+                println("APP-CONFIG-WARN: non-positive limit for model '$model'")
+                return@forEach
+            }
+            result[model] = limit
+        }
+        return result.toMap()
+    }
+
     // Paywall (используется в paywall-сообщениях)
     val PAYWALL_TEXT: String
         get() = "Лимит бесплатных сообщений исчерпан. " +
