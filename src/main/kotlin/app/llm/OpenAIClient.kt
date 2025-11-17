@@ -146,23 +146,28 @@ class OpenAIClient(
     }
 
     private fun supportsTemperature(model: String): Boolean {
-        val normalized = model.lowercase()
+        val canonical = canonicalModel(model)
         // семейства, где temperature сейчас НЕ поддерживается в /chat/completions
-        val noTemp = normalized.startsWith("gpt-4.1") ||
-            normalized.startsWith("o4") ||
-            normalized.contains("omni") ||
-            normalized.startsWith("gpt-5-") ||
-            normalized.startsWith("gpt-5.") ||
-            normalized == "gpt-5"
+        val noTemp = canonical.startsWith("gpt-4.1") ||
+            canonical.startsWith("o4") ||
+            canonical.contains("omni") ||
+            canonical.startsWith("gpt-5")
         return !noTemp
     }
 
     private fun usesCompletionTokens(model: String): Boolean {
-        val normalized = model.lowercase()
-        if (normalized.contains("reasoning")) return true
-        return normalized.startsWith("gpt-5") ||
-            normalized.startsWith("gpt-4.1") ||
-            normalized.startsWith("o3") ||
-            normalized.startsWith("o4")
+        val canonical = canonicalModel(model)
+        if (canonical.contains("reasoning")) return true
+        return canonical.startsWith("gpt-5") ||
+            canonical.startsWith("gpt-4.1") ||
+            canonical.startsWith("o3") ||
+            canonical.startsWith("o4")
+    }
+
+    private fun canonicalModel(model: String): String {
+        val trimmed = model.trim().lowercase()
+        val withoutSlash = trimmed.substringAfterLast('/')
+        val withoutPrefix = withoutSlash.substringAfterLast(':')
+        return withoutPrefix.substringBefore('@')
     }
 }
