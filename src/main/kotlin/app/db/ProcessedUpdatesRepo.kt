@@ -18,10 +18,9 @@ object ProcessedUpdatesRepo {
         var failed = false
         val inserted = runCatching {
             transaction {
-                val statement = ProcessedUpdates.insertIgnore {
+                ProcessedUpdates.insertIgnore {
                     it[ProcessedUpdates.updateId] = updateId
-                }
-                (statement?.insertedCount ?: 0) > 0
+                } != null
             }
         }.onFailure {
             failed = true

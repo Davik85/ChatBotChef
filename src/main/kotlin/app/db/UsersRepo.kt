@@ -154,14 +154,6 @@ object UsersRepo {
         Users.selectAll().count().toLong()
     }
 
-    fun countUsers(includeBlocked: Boolean): Long = transaction {
-        if (includeBlocked) {
-            Users.selectAll().count().toLong()
-        } else {
-            Users.select { Users.isBlocked eq false }.count().toLong()
-        }
-    }
-
     fun countBlocked(): Long = transaction {
         Users.select { Users.isBlocked eq true }.count().toLong()
     }
