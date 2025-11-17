@@ -7,15 +7,21 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import app.testsupport.assertEquals
+import app.testsupport.assertFalse
+import app.testsupport.assertTrue
+import java.io.File
+import kotlin.io.path.createTempFile
+import kotlin.io.path.pathString
 
 class UsersRepoBlockedTest {
+    private lateinit var dbFile: File
 
     @Before
     fun setUp() {
-        Database.connect("jdbc:sqlite::memory:")
+        val path = createTempFile(prefix = "users-blocked", suffix = ".sqlite")
+        dbFile = path.toFile().apply { deleteOnExit() }
+        Database.connect("jdbc:sqlite:${path.pathString}", driver = "org.sqlite.JDBC")
         TransactionManager.manager.defaultIsolationLevel = java.sql.Connection.TRANSACTION_SERIALIZABLE
         transaction {
             SchemaUtils.create(Users)
@@ -28,6 +34,9 @@ class UsersRepoBlockedTest {
             SchemaUtils.drop(Users)
         }
         TransactionManager.resetCurrent(null)
+        if (this::dbFile.isInitialized) {
+            dbFile.delete()
+        }
     }
 
     @Test
