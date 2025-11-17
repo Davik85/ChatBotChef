@@ -146,12 +146,14 @@ class OpenAIClient(
     }
 
     private fun supportsTemperature(model: String): Boolean {
-        val m = model.lowercase()
+        val normalized = model.lowercase()
         // семейства, где temperature сейчас НЕ поддерживается в /chat/completions
-        val noTemp = m.startsWith("gpt-4.1") ||
-            m.startsWith("o4") ||
-            m.contains("omni") ||
-            m.startsWith("gpt-5-")
+        val noTemp = normalized.startsWith("gpt-4.1") ||
+            normalized.startsWith("o4") ||
+            normalized.contains("omni") ||
+            normalized.startsWith("gpt-5-") ||
+            normalized.startsWith("gpt-5.") ||
+            normalized == "gpt-5"
         return !noTemp
     }
 
