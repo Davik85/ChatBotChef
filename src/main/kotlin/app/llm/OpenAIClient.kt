@@ -15,8 +15,6 @@ import java.time.Duration
 class OpenAIClient(
     private val apiKey: String,
     private val model: String = "gpt-5.1",
-    // Use project-wide constant for long recipes
-    private val maxCompletionTokens: Int = AppConfig.OPENAI_MAX_TOKENS,
     /** Для моделей, которые поддерживают. Для 4.1/omni/o4 не отправляем вовсе. */
     private val temperature: Double? = null
 ) {
@@ -83,10 +81,11 @@ class OpenAIClient(
             "model" to model,
             "messages" to messages,
         )
+        val maxTokens = resolveMaxTokens(model)
         if (usesCompletionTokens(model)) {
-            payload["max_completion_tokens"] = maxCompletionTokens
+            payload["max_completion_tokens"] = maxTokens
         } else {
-            payload["max_tokens"] = maxCompletionTokens
+            payload["max_tokens"] = maxTokens
         }
         if (supportsTemperature(model) && temperature != null) {
             payload["temperature"] = temperature
@@ -143,6 +142,26 @@ class OpenAIClient(
             }
         }
         return AppConfig.FALLBACK_REPLY
+    }
+
+    private fun resolveMaxTokens(model: String): Int {
+        val normalized = model.lowercase()
+        val fallback = AppConfig.OPENAI_MAX_TOKENS
+        val specific = AppConfig.openAiModelTokenLimits[normalized]
+        return when {
+            specific == null -> {
+                println("OPENAI-TOKENS-INFO: model=$model limit=$fallback source=global_default")
+                fallback
+            }
+            specific <= 0 -> {
+                println("OPENAI-TOKENS-WARN: model=$model invalid_limit=$specific fallback=$fallback")
+                fallback
+            }
+            else -> {
+                println("OPENAI-TOKENS-INFO: model=$model limit=$specific source=model_override")
+                specific
+            }
+        }
     }
 
     private fun supportsTemperature(model: String): Boolean {
