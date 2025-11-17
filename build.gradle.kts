@@ -1,13 +1,18 @@
 import org.gradle.api.file.DuplicatesStrategy
+import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.bundling.Jar
 import org.gradle.kotlin.dsl.register
+import org.gradle.language.base.plugins.LifecycleBasePlugin
 
 plugins {
     kotlin("jvm") version "2.0.21"
     application
 }
 
-repositories { mavenCentral() }
+repositories {
+    mavenCentral()
+    maven { url = uri("https://repo1.maven.org/maven2") }
+}
 
 dependencies {
     // DB
@@ -23,14 +28,25 @@ dependencies {
 
     // Логи
     implementation("org.slf4j:slf4j-simple:2.0.13")
-
-    testImplementation(kotlin("test"))
 }
 
 kotlin { jvmToolchain(21) }
 
 application {
     mainClass.set("app.MainKt")
+}
+
+val manualTest = tasks.register<JavaExec>("manualTest") {
+    group = LifecycleBasePlugin.VERIFICATION_GROUP
+    description = "Runs manual test harness"
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("app.ManualTestRunner")
+    dependsOn(tasks.testClasses)
+}
+
+tasks.test {
+    dependsOn(manualTest)
+    onlyIf { false }
 }
 
 /**

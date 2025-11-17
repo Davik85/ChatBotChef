@@ -41,9 +41,19 @@ object AppConfig {
     val openAiOrg: String? by lazy { clean(readRaw("OPENAI_ORG")) }
     val openAiProject: String? by lazy { clean(readRaw("OPENAI_PROJECT")) }
 
+    // --- OpenAI модель ---
+    val openAiModel: String by lazy { clean(readRaw("OPENAI_MODEL")) ?: "gpt-5.1" }
+    private val reasoningEffortValues = setOf("low", "medium", "high")
+    val openAiReasoningEffort: String? by lazy {
+        val raw = clean(readRaw("OPENAI_REASONING_EFFORT"))?.lowercase(Locale.ROOT) ?: return@lazy null
+        require(raw in reasoningEffortValues) { "OPENAI_REASONING_EFFORT must be one of ${reasoningEffortValues.joinToString()}" }
+        raw
+    }
+
     // --- общие константы ---
     const val TELEGRAM_BASE = "https://api.telegram.org"
     const val OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+    const val OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
     const val OPENAI_MAX_TOKENS = 1800
     const val MAX_REPLY_CHARS = 3500
     const val FREE_TOTAL_MSG_LIMIT = 10

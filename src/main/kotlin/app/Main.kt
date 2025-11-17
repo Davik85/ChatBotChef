@@ -40,7 +40,13 @@ fun main() {
         runCatching { DatabaseFactory.init() }
             .onFailure { println("DB-INIT-ERR: ${it.message}") }
 
-        val llm = OpenAIClient(apiKey = aiKey)
+        val aiModel = AppConfig.openAiModel
+        println("BOOT-OPENAI-MODEL: $aiModel")
+
+        val llm = OpenAIClient(
+            apiKey = aiKey,
+            model = aiModel
+        )
 
         if (!llm.healthCheck()) {
             println("FATAL: OpenAI недоступен (ключ/доступ/проект). Проверь OPENAI_API_KEY / OPENAI_ORG / OPENAI_PROJECT.")

@@ -6,12 +6,12 @@ import org.jetbrains.exposed.sql.transactions.transaction
 import java.io.File
 import kotlin.io.path.createTempFile
 import kotlin.io.path.pathString
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import app.testsupport.AfterTest
+import app.testsupport.BeforeTest
+import app.testsupport.Test
+import app.testsupport.assertEquals
+import app.testsupport.assertFalse
+import app.testsupport.assertTrue
 
 class ProcessedUpdatesRepoTest {
     private lateinit var dbFile: File
@@ -38,7 +38,7 @@ class ProcessedUpdatesRepoTest {
     fun firstArrivalIsProcessed() {
         val inserted = ProcessedUpdatesRepo.tryInsert(101)
         assertTrue(inserted)
-        assertEquals(101, ProcessedUpdatesRepo.lastProcessedId())
+        assertEquals(101L, ProcessedUpdatesRepo.lastProcessedId())
     }
 
     @Test
